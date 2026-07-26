@@ -33,27 +33,45 @@ export interface AudioChunkAck {
   droppedChunks: number;
 }
 
-/** Server → Browser: partial transcript delta */
-export interface SttTranscriptDelta {
-  type: 'stt.transcript.delta';
+/** Server → Browser (admin): streaming Korean source transcript delta */
+export interface TranscriptDelta {
+  type: 'transcript.delta';
   text: string;
 }
 
-/** Server → Browser: final Korean transcript (after commit) */
-export interface SttTranscriptFinal {
-  type: 'stt.transcript.final';
+/** Server → Browser (admin): streaming translated text delta */
+export interface TranslationDelta {
+  type: 'translation.delta';
+  language: OutputLanguage;
   text: string;
 }
 
-/** Server → Browser: OpenAI connection status */
-export interface SttConnectionStatus {
-  type: 'stt.connection';
+/** Server → Browser (viewer): streaming subtitle delta */
+export interface SubtitleDelta {
+  type: 'subtitle.delta';
+  text: string;
+}
+
+/** Server → Browser: translation session connection status */
+export interface TranslateConnectionStatus {
+  type: 'translate.connection';
   status: 'connected' | 'disconnected' | 'error';
+  language: OutputLanguage;
   message?: string;
 }
 
-/** Supported viewer languages */
-export type ViewerLanguage = 'en' | 'zhHans' | 'zhHant';
+/** Server → Browser (admin): translation latency measurement */
+export interface TranslateLatency {
+  type: 'translate.latency';
+  language: OutputLanguage;
+  ms: number;
+}
+
+/** Supported output languages for gpt-realtime-translate */
+export type OutputLanguage = 'en' | 'zh';
+
+/** Supported viewer languages (zh serves both simplified and traditional for now) */
+export type ViewerLanguage = 'en' | 'zh';
 
 /** Browser → Server: viewer joins a session */
 export interface ViewerJoin {
@@ -68,31 +86,6 @@ export interface ViewerChangeLanguage {
   language: ViewerLanguage;
 }
 
-/** Server → Browser (viewer): final subtitle in selected language */
-export interface SubtitleFinal {
-  type: 'subtitle.final';
-  sourceText: string;
-  language: ViewerLanguage;
-  text: string;
-  createdAt: number;
-}
-
-/** Server → Browser: translation completed */
-export interface TranslationCompleted {
-  type: 'translation.completed';
-  sourceText: string;
-  en: string;
-  zhHans: string;
-  zhHant: string;
-}
-
-/** Server → Browser: translation failed */
-export interface TranslationError {
-  type: 'translation.error';
-  sourceText: string;
-  message: string;
-}
-
 /** Server → Browser (admin): real-time viewer count */
 export interface ViewerCountUpdate {
   type: 'viewer.count';
@@ -105,12 +98,11 @@ export interface ViewerCountUpdate {
 export type ServerMessage =
   | AudioChunkAck
   | AudioStopAck
-  | SttTranscriptDelta
-  | SttTranscriptFinal
-  | SttConnectionStatus
-  | TranslationCompleted
-  | TranslationError
+  | TranscriptDelta
+  | TranslationDelta
+  | TranslateConnectionStatus
+  | TranslateLatency
   | ViewerCountUpdate;
 
 /** Union of all server → viewer browser messages */
-export type ViewerMessage = SubtitleFinal;
+export type ViewerMessage = SubtitleDelta;

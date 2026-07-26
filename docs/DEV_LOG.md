@@ -566,7 +566,115 @@ Admin 페이지 상단에 세션 안내 카드 추가.
 
 ### 다음 단계
 
-- [ ] commit 임계값(RMS, 침묵 시간) 실제 설교 환경에서 튜닝
-- [ ] Viewer 수 서버에서 admin으로 전송
-- [ ] PostgreSQL async 저장
-- [ ] session 생성/관리 (자동 sessionCode 생성)
+- [x] 실제 설교 음성으로 E2E 테스트
+- [x] gpt-realtime-translate 전환
+
+---
+
+## 2026-07-26 — gpt-realtime-translate 전환 + E2E 테스트
+
+### 문제
+
+유튜브 설교 영상으로 테스트 시, 연속 발화에서 RMS 기반 침묵 감지가 commit을 발생시키지 못해 transcript가 생성되지 않는 치명적 문제 발견.
+
+```
+설교자가 쉬지 않고 말함 → RMS가 0.003 이하로 1.5초 안 내려감
+→ commit 안 됨 → transcript 없음 → 번역 없음 → 자막 없음
+```
+
+### 해결: gpt-realtime-translate 전환
+
+리서치 결과, OpenAI가 2026-05-07에 출시한 `gpt-realtime-translate` 모델이 이 문제를 근본적으로 해결:
+
+- STT + 번역을 하나의 API가 처리 (일체형)
+- 세그멘테이션을 모델이 자동으로 처리 → 수동 commit 불필요
+- 스트리밍 delta 출력 → 실시간 자막
+
+| 항목 | 이전 (v1) | 전환 후 (v2) |
+|------|-----------|-------------|
+| STT | gpt-4o-transcribe + RMS 침묵감지 + 수동 commit | gpt-realtime-whisper (내장, 자동) |
+| 번역 | gpt-4.1-mini Responses API 별도 호출 | gpt-realtime-translate 내장 |
+| 세그멘테이션 | RMS + 1.5초 침묵 → commit | 모델 자동 |
+| 엔드포인트 | `wss://.../realtime?intent=transcription` | `wss://.../realtime/translations?model=gpt-realtime-translate` |
+| 가격 | STT + 번역 각각 | $0.034/분 (세션당) |
+
+### 코드 변경
+
+| 파일 | 변경 |
+|------|------|
+| `src/server/openai/translateClient.ts` | **신규** — gpt-realtime-translate WebSocket 클라이언트 |
+| `src/server/openai/realtimeClient.ts` | **삭제** — RMS/commit 로직 제거 |
+| `src/server/openai/translator.ts` | **삭제** — 별도 번역 불필요 |
+| `src/server/ws/server.ts` | **재작성** — translate 세션 관리, delta broadcast |
+| `src/lib/types/audio.ts` | **재작성** — 스트리밍 delta 타입, ViewerLanguage를 en/zh로 단순화 |
+| `src/components/admin/AudioChunkTest.tsx` | **재작성** — 실시간 스트리밍 표시, 레이턴시 측정 |
+| `src/components/viewer/SubtitleViewer.tsx` | **재작성** — delta 누적 표시 |
+| `docs/ARCHITECTURE.md` | **재작성** — 새 파이프라인 문서화 |
+
+### API 이벤트 확정 (실제 테스트로 검증)
+
+| 용도 | 이벤트 |
+|------|--------|
+| 오디오 전송 | `session.input_audio_buffer.append` |
+| 번역 수신 | `session.output_transcript.delta` |
+| 원본 전사 수신 | `session.input_transcript.delta` |
+| 세션 설정 | `session.update` |
+| 종료 | `session.close` |
+
+※ `input_audio_buffer.append` (session prefix 없음)은 거부됨 → `session.input_audio_buffer.append` 사용
+
+### 세션 설정 (지원 파라미터 전수 조사 완료)
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "audio": {
+      "input": {
+        "transcription": { "model": "gpt-realtime-whisper" },
+        "noise_reduction": { "type": "near_field" }
+      },
+      "output": { "language": "en" }
+    }
+  }
+}
+```
+
+**미지원 확인된 파라미터** (Unknown parameter 에러):
+- `transcription.language` — translate 세션에서 미지원 (자동 감지)
+- `transcription.delay` — translate 세션에서 미지원
+- `instructions` — translate 세션에서 미지원
+
+### E2E 테스트 결과 (유튜브 설교)
+
+테스트 환경: VB-Audio Virtual Cable, 유튜브 설교 영상
+
+| 항목 | 결과 |
+|------|------|
+| 연결 | EN/ZH 세션 동시 연결 성공 |
+| 레이턴시 (스트리밍) | EN 49ms, ZH 42ms |
+| 한국어 전사 | 대체로 정확. 일부 오류: "거룩하신"→"걸어가신", "열왕기하"→"열한기하" |
+| 영어 번역 | 자연스럽고 대체로 정확. "거룩하신"→"risen" 오역 (holy가 맞음) |
+| 중국어 번역 | 출력 확인. "奉复活主耶稣基督的名" (동일 오역) |
+| 열왕기하 번역 | "2 Kings" 정확 (STT 오류에도 번역이 보정) |
+| 연속 발화 | 문제 없음 — 모델이 자동으로 세그멘테이션 |
+
+### 번역 품질 이슈
+
+`gpt-realtime-translate`는 instructions/용어집/delay 파라미터를 지원하지 않아 번역 품질 튜닝 불가.
+
+알려진 오역:
+- "거룩하신 주 예수 그리스도" → "the risen Lord Jesus Christ" (risen ≠ holy)
+
+### 비용
+
+| 구성 | 분당 | 시간당 |
+|------|------|--------|
+| EN 1세션 | $0.034 | $2.04 |
+| EN+ZH 2세션 | $0.068 | $4.08 |
+
+### 다음 단계
+
+- [ ] 세션 관리 (자동 sessionCode 생성) — TEST-001 하드코딩 제거
+- [ ] PostgreSQL 비동기 저장
+- [ ] (추후) 관리자 교정 기능: Admin이 한국어 전사 오류 수정 → 재번역 → viewer에 교정본 push + 색깔 표시

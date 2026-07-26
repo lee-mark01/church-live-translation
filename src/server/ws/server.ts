@@ -1,20 +1,19 @@
 import { WebSocketServer, WebSocket } from 'ws';
-import { RealtimeClient } from '../openai/realtimeClient';
-import { translateTranscript } from '../openai/translator';
+import { TranslateClient } from '../openai/translateClient';
 import type {
   AudioChunkMessage,
   AudioChunkAck,
   AudioStopAck,
-  SttTranscriptDelta,
-  SttTranscriptFinal,
-  SttConnectionStatus,
-  TranslationCompleted,
-  TranslationError,
+  TranscriptDelta,
+  TranslationDelta,
+  TranslateConnectionStatus,
+  TranslateLatency,
   ViewerJoin,
   ViewerChangeLanguage,
   ViewerLanguage,
   ViewerCountUpdate,
-  SubtitleFinal,
+  OutputLanguage,
+  SubtitleDelta,
 } from '../../lib/types/audio';
 
 const PORT = Number(process.env.WS_PORT) || 3001;
@@ -24,7 +23,7 @@ const wss = new WebSocketServer({ port: PORT });
 console.log(`[ws] WebSocket server listening on ws://localhost:${PORT}`);
 
 if (!OPENAI_API_KEY) {
-  console.warn('[ws] OPENAI_API_KEY not set — STT will be disabled');
+  console.warn('[ws] OPENAI_API_KEY not set — translation will be disabled');
 }
 
 // --- Viewer management ---
@@ -60,31 +59,18 @@ function removeViewer(ws: WebSocket): void {
   }
 }
 
-function broadcastToViewers(sessionCode: string, result: TranslationCompleted): void {
+function broadcastToViewers(sessionCode: string, language: ViewerLanguage, text: string): void {
   const clients = viewers.get(sessionCode);
   if (!clients || clients.length === 0) return;
 
-  const createdAt = Date.now();
-  const languageMap: Record<ViewerLanguage, string> = {
-    en: result.en,
-    zhHans: result.zhHans,
-    zhHant: result.zhHant,
-  };
+  const msg: SubtitleDelta = { type: 'subtitle.delta', text };
+  const payload = JSON.stringify(msg);
 
   for (const client of clients) {
+    if (client.language !== language) continue;
     if (client.ws.readyState !== WebSocket.OPEN) continue;
-
-    const subtitle: SubtitleFinal = {
-      type: 'subtitle.final',
-      sourceText: result.sourceText,
-      language: client.language,
-      text: languageMap[client.language],
-      createdAt,
-    };
-    client.ws.send(JSON.stringify(subtitle));
+    client.ws.send(payload);
   }
-
-  console.log(`[ws] broadcast to ${clients.length} viewer(s) in session=${sessionCode}`);
 }
 
 // --- Admin tracking ---
@@ -92,7 +78,7 @@ const adminClients = new Map<string, WebSocket>();
 
 function getViewerCount(sessionCode: string): { total: number; byLanguage: Record<ViewerLanguage, number> } {
   const clients = viewers.get(sessionCode) ?? [];
-  const byLanguage: Record<ViewerLanguage, number> = { en: 0, zhHans: 0, zhHant: 0 };
+  const byLanguage: Record<ViewerLanguage, number> = { en: 0, zh: 0 };
   for (const c of clients) {
     byLanguage[c.language]++;
   }
@@ -116,7 +102,6 @@ function notifyAdminViewerCount(sessionCode: string): void {
 wss.on('connection', (ws: WebSocket) => {
   console.log('[ws] client connected');
 
-  // Track whether this client has identified as admin or viewer
   let role: 'unknown' | 'admin' | 'viewer' = 'unknown';
   let adminSessionCode: string | null = null;
 
@@ -124,8 +109,9 @@ wss.on('connection', (ws: WebSocket) => {
   let expectedSeq = 1;
   let totalChunks = 0;
   let droppedChunks = 0;
-  let openai: RealtimeClient | null = null;
-  const pendingTranslations: Set<Promise<void>> = new Set();
+
+  // Translation sessions (one per output language)
+  const translateSessions = new Map<OutputLanguage, TranslateClient>();
 
   ws.on('message', (raw: Buffer) => {
     let msg: { type: string; [key: string]: unknown };
@@ -147,7 +133,6 @@ wss.on('connection', (ws: WebSocket) => {
     // --- Viewer language change ---
     if (msg.type === 'viewer.changeLanguage') {
       const change = msg as unknown as ViewerChangeLanguage;
-      // Find and update this viewer's language
       for (const [sessionCode, clients] of viewers) {
         const client = clients.find((c) => c.ws === ws);
         if (client) {
@@ -163,24 +148,16 @@ wss.on('connection', (ws: WebSocket) => {
     // --- Admin safe stop ---
     if (msg.type === 'audio.stop') {
       console.log('[ws] admin requested safe stop');
-      void (async () => {
-        // 1. Flush remaining audio and wait for transcript
-        if (openai) {
-          await openai.flushAndClose();
-        }
 
-        // 2. Wait for all pending translations (max 3s)
-        if (pendingTranslations.size > 0) {
-          console.log(`[ws] waiting for ${pendingTranslations.size} pending translation(s)`);
-          await Promise.race([
-            Promise.allSettled([...pendingTranslations]),
-            new Promise((r) => setTimeout(r, 3000)),
-          ]);
-        }
+      // Disconnect all translation sessions
+      for (const [lang, client] of translateSessions) {
+        console.log(`[ws] closing translate session: ${lang}`);
+        client.disconnect();
+      }
+      translateSessions.clear();
 
-        sendToAdmin<AudioStopAck>({ type: 'audio.stop.ack' });
-        console.log('[ws] safe stop complete, sent ack');
-      })();
+      sendToAdmin<AudioStopAck>({ type: 'audio.stop.ack' });
+      console.log('[ws] safe stop complete, sent ack');
       return;
     }
 
@@ -196,68 +173,12 @@ wss.on('connection', (ws: WebSocket) => {
       adminClients.set(adminSessionCode, ws);
       console.log(`[ws] admin identified for session=${adminSessionCode}`);
 
-      // Send current viewer count immediately
       notifyAdminViewerCount(adminSessionCode);
 
-      // Start OpenAI connection for this admin
+      // Start translation sessions
       if (OPENAI_API_KEY) {
-        openai = new RealtimeClient(OPENAI_API_KEY);
-
-        openai.on('connected', () => {
-          sendToAdmin<SttConnectionStatus>({ type: 'stt.connection', status: 'connected' });
-        });
-
-        openai.on('disconnected', () => {
-          sendToAdmin<SttConnectionStatus>({ type: 'stt.connection', status: 'disconnected' });
-        });
-
-        openai.on('error', (message) => {
-          sendToAdmin<SttConnectionStatus>({ type: 'stt.connection', status: 'error', message });
-        });
-
-        openai.on('transcript_delta', (text) => {
-          sendToAdmin<SttTranscriptDelta>({ type: 'stt.transcript.delta', text });
-        });
-
-        openai.on('transcript_final', (text) => {
-          sendToAdmin<SttTranscriptFinal>({ type: 'stt.transcript.final', text });
-
-          // Translate async — don't block STT pipeline
-          const translationPromise = translateTranscript(text)
-            .then((result) => {
-              console.log(`[translation] done: "${text}" → en="${result.en}"`);
-
-              const translationMsg: TranslationCompleted = {
-                type: 'translation.completed',
-                sourceText: result.sourceText,
-                en: result.en,
-                zhHans: result.zhHans,
-                zhHant: result.zhHant,
-              };
-
-              // Send to admin
-              sendToAdmin<TranslationCompleted>(translationMsg);
-
-              // Broadcast to viewers
-              if (adminSessionCode) {
-                broadcastToViewers(adminSessionCode, translationMsg);
-              }
-            })
-            .catch((err) => {
-              console.error('[translation] error:', err);
-              sendToAdmin<TranslationError>({
-                type: 'translation.error',
-                sourceText: text,
-                message: err instanceof Error ? err.message : String(err),
-              });
-            })
-            .finally(() => {
-              pendingTranslations.delete(translationPromise);
-            });
-          pendingTranslations.add(translationPromise);
-        });
-
-        openai.connect();
+        startTranslateSession('en');
+        startTranslateSession('zh');
       }
     }
 
@@ -283,7 +204,7 @@ wss.on('connection', (ws: WebSocket) => {
       );
     }
 
-    // Send ack with running stats
+    // Send ack
     sendToAdmin<AudioChunkAck>({
       type: 'audio.chunk.ack',
       seq: audioMsg.seq,
@@ -293,9 +214,9 @@ wss.on('connection', (ws: WebSocket) => {
       droppedChunks,
     });
 
-    // Forward audio to OpenAI (with RMS for silence detection)
-    if (openai?.isConnected) {
-      openai.appendAudio(audioMsg.audio, audioMsg.rms);
+    // Forward audio to all translate sessions
+    for (const client of translateSessions.values()) {
+      client.appendAudio(audioMsg.audio);
     }
   });
 
@@ -305,13 +226,76 @@ wss.on('connection', (ws: WebSocket) => {
       if (adminSessionCode && adminClients.get(adminSessionCode) === ws) {
         adminClients.delete(adminSessionCode);
       }
-      openai?.disconnect();
+      for (const client of translateSessions.values()) {
+        client.disconnect();
+      }
+      translateSessions.clear();
     } else if (role === 'viewer') {
       removeViewer(ws);
     } else {
       console.log('[ws] unknown client disconnected');
     }
   });
+
+  function startTranslateSession(language: OutputLanguage): void {
+    const client = new TranslateClient(OPENAI_API_KEY!, language);
+
+    client.on('connected', () => {
+      sendToAdmin<TranslateConnectionStatus>({
+        type: 'translate.connection',
+        status: 'connected',
+        language,
+      });
+    });
+
+    client.on('disconnected', () => {
+      sendToAdmin<TranslateConnectionStatus>({
+        type: 'translate.connection',
+        status: 'disconnected',
+        language,
+      });
+    });
+
+    client.on('error', (message) => {
+      sendToAdmin<TranslateConnectionStatus>({
+        type: 'translate.connection',
+        status: 'error',
+        language,
+        message,
+      });
+    });
+
+    // Latency measurement
+    client.on('latency', (ms) => {
+      console.log(`[translate:${language}] latency: ${ms}ms`);
+      sendToAdmin<TranslateLatency>({ type: 'translate.latency', language, ms });
+    });
+
+    // Korean source transcript (only need from one session, use 'en')
+    if (language === 'en') {
+      client.on('input_delta', (text) => {
+        sendToAdmin<TranscriptDelta>({ type: 'transcript.delta', text });
+      });
+    }
+
+    // Translated text → admin + viewers
+    client.on('output_delta', (text) => {
+      // Send to admin
+      sendToAdmin<TranslationDelta>({
+        type: 'translation.delta',
+        language,
+        text,
+      });
+
+      // Broadcast to viewers of this language
+      if (adminSessionCode) {
+        broadcastToViewers(adminSessionCode, language, text);
+      }
+    });
+
+    client.connect();
+    translateSessions.set(language, client);
+  }
 
   function sendToAdmin<T>(msg: T): void {
     if (ws.readyState === WebSocket.OPEN) {

@@ -5,24 +5,13 @@ import { QRCodeSVG } from 'qrcode.react';
 import type {
   AudioChunkMessage,
   AudioChunkAck,
-  SttTranscriptDelta,
-  SttTranscriptFinal,
-  SttConnectionStatus,
-  TranslationCompleted,
-  TranslationError,
+  TranscriptDelta,
+  TranslationDelta,
+  TranslateConnectionStatus,
+  TranslateLatency,
   ViewerCountUpdate,
   ServerMessage,
 } from '@/lib/types/audio';
-
-interface TranscriptItem {
-  id: number;
-  sourceText: string;
-  en?: string;
-  zhHans?: string;
-  zhHant?: string;
-  translationStatus: 'pending' | 'completed' | 'error';
-  translationError?: string;
-}
 
 const OUTPUT_SAMPLE_RATE = 24000;
 const CHUNK_MS = 100;
@@ -36,31 +25,29 @@ export default function AudioChunkTest() {
 
   // Local chunk stats
   const [chunkCount, setChunkCount] = useState(0);
-  const [latestChunkSize, setLatestChunkSize] = useState<number | null>(null);
-  const [chunkInterval, setChunkInterval] = useState<number | null>(null);
-  const [sequenceOk, setSequenceOk] = useState(true);
   const [currentRms, setCurrentRms] = useState<number | null>(null);
 
-  // Server stats (from ack)
+  // Server stats
   const [wsConnected, setWsConnected] = useState(false);
   const [lastAckLatency, setLastAckLatency] = useState<number | null>(null);
   const [serverTotalChunks, setServerTotalChunks] = useState(0);
   const [serverDroppedChunks, setServerDroppedChunks] = useState(0);
 
-  // STT state
-  const [sttConnected, setSttConnected] = useState(false);
+  // Translation state
+  const [enConnected, setEnConnected] = useState(false);
+  const [zhConnected, setZhConnected] = useState(false);
   const [viewerCount, setViewerCount] = useState<ViewerCountUpdate | null>(null);
-  const [partialText, setPartialText] = useState('');
-  const [transcriptItems, setTranscriptItems] = useState<TranscriptItem[]>([]);
+  const [koreanText, setKoreanText] = useState('');
+  const [enText, setEnText] = useState('');
+  const [zhText, setZhText] = useState('');
+  const [enLatency, setEnLatency] = useState<number | null>(null);
+  const [zhLatency, setZhLatency] = useState<number | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const lastChunkTimeRef = useRef<number | null>(null);
   const expectedIndexRef = useRef(1);
-
-  const expectedSize = Math.floor((OUTPUT_SAMPLE_RATE * CHUNK_MS) / 1000) * 2;
 
   const stopAudio = useCallback(() => {
     workletNodeRef.current?.disconnect();
@@ -79,14 +66,14 @@ export default function AudioChunkTest() {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       wsRef.current = null;
       setWsConnected(false);
-      setSttConnected(false);
+      setEnConnected(false);
+      setZhConnected(false);
       return;
     }
 
-    // Request safe stop — server will flush remaining audio
+    // Request safe stop
     ws.send(JSON.stringify({ type: 'audio.stop' }));
 
-    // Wait for ack or timeout, then close
     const onMessage = (e: MessageEvent) => {
       const msg = JSON.parse(e.data) as ServerMessage;
       if (msg.type === 'audio.stop.ack') {
@@ -95,10 +82,7 @@ export default function AudioChunkTest() {
       }
     };
 
-    const timer = setTimeout(() => {
-      cleanup();
-    }, 3000);
-
+    const timer = setTimeout(() => cleanup(), 3000);
     ws.addEventListener('message', onMessage);
 
     function cleanup() {
@@ -106,7 +90,8 @@ export default function AudioChunkTest() {
       ws!.close();
       wsRef.current = null;
       setWsConnected(false);
-      setSttConnected(false);
+      setEnConnected(false);
+      setZhConnected(false);
     }
   }, [stopAudio]);
 
@@ -114,16 +99,15 @@ export default function AudioChunkTest() {
     try {
       setError(null);
       setChunkCount(0);
-      setLatestChunkSize(null);
-      setChunkInterval(null);
-      setSequenceOk(true);
+      setCurrentRms(null);
       setLastAckLatency(null);
       setServerTotalChunks(0);
       setServerDroppedChunks(0);
-      setCurrentRms(null);
-      setPartialText('');
-      setTranscriptItems([]);
-      lastChunkTimeRef.current = null;
+      setKoreanText('');
+      setEnText('');
+      setZhText('');
+      setEnLatency(null);
+      setZhLatency(null);
       expectedIndexRef.current = 1;
 
       // 1. Connect WebSocket
@@ -149,68 +133,31 @@ export default function AudioChunkTest() {
             setServerDroppedChunks(ack.droppedChunks);
             break;
           }
-          case 'stt.connection': {
-            const conn = msg as SttConnectionStatus;
-            setSttConnected(conn.status === 'connected');
+          case 'translate.connection': {
+            const conn = msg as TranslateConnectionStatus;
+            const connected = conn.status === 'connected';
+            if (conn.language === 'en') setEnConnected(connected);
+            if (conn.language === 'zh') setZhConnected(connected);
             if (conn.status === 'error') {
-              console.error('[stt] error:', conn.message);
+              console.error(`[translate:${conn.language}] error:`, conn.message);
             }
             break;
           }
-          case 'stt.transcript.delta': {
-            const delta = msg as SttTranscriptDelta;
-            setPartialText((prev) => prev + delta.text);
+          case 'transcript.delta': {
+            const delta = msg as TranscriptDelta;
+            setKoreanText((prev) => prev + delta.text);
             break;
           }
-          case 'stt.transcript.final': {
-            const t = msg as SttTranscriptFinal;
-            setTranscriptItems((prev) => [
-              ...prev,
-              {
-                id: Date.now(),
-                sourceText: t.text,
-                translationStatus: 'pending',
-              },
-            ]);
-            setPartialText('');
+          case 'translation.delta': {
+            const delta = msg as TranslationDelta;
+            if (delta.language === 'en') setEnText((prev) => prev + delta.text);
+            if (delta.language === 'zh') setZhText((prev) => prev + delta.text);
             break;
           }
-          case 'translation.completed': {
-            const tr = msg as TranslationCompleted;
-            setTranscriptItems((prev) => {
-              const next = [...prev];
-              for (let i = next.length - 1; i >= 0; i--) {
-                if (next[i].sourceText === tr.sourceText && next[i].translationStatus === 'pending') {
-                  next[i] = {
-                    ...next[i],
-                    en: tr.en,
-                    zhHans: tr.zhHans,
-                    zhHant: tr.zhHant,
-                    translationStatus: 'completed',
-                  };
-                  break;
-                }
-              }
-              return next;
-            });
-            break;
-          }
-          case 'translation.error': {
-            const tr = msg as TranslationError;
-            setTranscriptItems((prev) => {
-              const next = [...prev];
-              for (let i = next.length - 1; i >= 0; i--) {
-                if (next[i].sourceText === tr.sourceText && next[i].translationStatus === 'pending') {
-                  next[i] = {
-                    ...next[i],
-                    translationStatus: 'error',
-                    translationError: tr.message,
-                  };
-                  break;
-                }
-              }
-              return next;
-            });
+          case 'translate.latency': {
+            const lat = msg as TranslateLatency;
+            if (lat.language === 'en') setEnLatency(lat.ms);
+            if (lat.language === 'zh') setZhLatency(lat.ms);
             break;
           }
           case 'viewer.count': {
@@ -222,7 +169,8 @@ export default function AudioChunkTest() {
 
       ws.onclose = () => {
         setWsConnected(false);
-        setSttConnected(false);
+        setEnConnected(false);
+        setZhConnected(false);
       };
 
       // 2. Get audio stream
@@ -267,22 +215,12 @@ export default function AudioChunkTest() {
             pcm16: ArrayBuffer;
             rms: number;
           };
-          const now = performance.now();
           const capturedAt = Date.now();
           const sizeBytes = pcm16.byteLength;
 
           setChunkCount(chunkIndex);
-          setLatestChunkSize(sizeBytes);
           setCurrentRms(rms);
 
-          if (lastChunkTimeRef.current !== null) {
-            setChunkInterval(Math.round(now - lastChunkTimeRef.current));
-          }
-          lastChunkTimeRef.current = now;
-
-          if (chunkIndex !== expectedIndexRef.current) {
-            setSequenceOk(false);
-          }
           expectedIndexRef.current = chunkIndex + 1;
 
           // Send to WebSocket server
@@ -321,9 +259,7 @@ export default function AudioChunkTest() {
   }, []);
 
   useEffect(() => {
-    return () => {
-      stop();
-    };
+    return () => { stop(); };
   }, [stop]);
 
   const [viewerUrl, setViewerUrl] = useState(`/watch/${SESSION_CODE}`);
@@ -393,7 +329,8 @@ export default function AudioChunkTest() {
 
           <Badge active={isRunning} label={isRunning ? 'Running' : 'Stopped'} />
           <Badge active={wsConnected} label={wsConnected ? 'WS' : 'WS Off'} />
-          <Badge active={sttConnected} label={sttConnected ? 'STT' : 'STT Off'} />
+          <Badge active={enConnected} label={enConnected ? 'EN' : 'EN Off'} />
+          <Badge active={zhConnected} label={zhConnected ? 'ZH' : 'ZH Off'} />
         </div>
 
         {/* RMS level bar */}
@@ -414,10 +351,17 @@ export default function AudioChunkTest() {
           </div>
         )}
 
+        {/* Latency */}
+        {(enLatency !== null || zhLatency !== null) && (
+          <p className="mt-2 text-xs text-zinc-400">
+            Latency: EN {enLatency !== null ? `${enLatency}ms` : '—'} · ZH {zhLatency !== null ? `${zhLatency}ms` : '—'}
+          </p>
+        )}
+
         {/* Viewer count */}
         <p className="mt-2 text-xs text-zinc-400">
           Viewers: {viewerCount
-            ? `${viewerCount.total} (EN ${viewerCount.byLanguage.en} · 简 ${viewerCount.byLanguage.zhHans} · 繁 ${viewerCount.byLanguage.zhHant})`
+            ? `${viewerCount.total} (EN ${viewerCount.byLanguage.en} · 中 ${viewerCount.byLanguage.zh})`
             : '—'}
         </p>
       </section>
@@ -428,56 +372,29 @@ export default function AudioChunkTest() {
         </div>
       )}
 
-      {/* Transcript & Translation */}
+      {/* Live Translation Stream */}
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
         <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-          Transcript & Translation
+          Live Translation
         </h2>
-        <div className="min-h-[120px]">
-          {partialText && (
-            <p className="mb-2 text-sm text-zinc-400 italic">{partialText}</p>
-          )}
-
-          {transcriptItems.length === 0 && !partialText ? (
-            <p className="text-sm text-zinc-400">
-              {sttConnected ? 'Waiting for speech...' : 'STT not connected'}
-            </p>
+        <div className="space-y-4 min-h-[120px]">
+          {!enConnected && !zhConnected ? (
+            <p className="text-sm text-zinc-400">Translation not connected</p>
           ) : (
-            <div className="space-y-3">
-              {transcriptItems.map((item, index) => (
-                <div key={item.id} className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-700">
-                  <p className="mb-2 text-xs text-zinc-400">#{index + 1}</p>
-                  <div className="space-y-2 text-sm">
-                    <p>
-                      <span className="font-semibold">Korean</span>: {item.sourceText}
-                    </p>
-                    <p>
-                      <span className="font-semibold">English</span>:{' '}
-                      <span className={item.en ? '' : 'text-zinc-400 italic'}>
-                        {item.en ?? 'Translating...'}
-                      </span>
-                    </p>
-                    <p>
-                      <span className="font-semibold">简体中文</span>:{' '}
-                      <span className={item.zhHans ? '' : 'text-zinc-400 italic'}>
-                        {item.zhHans ?? 'Translating...'}
-                      </span>
-                    </p>
-                    <p>
-                      <span className="font-semibold">繁體中文</span>:{' '}
-                      <span className={item.zhHant ? '' : 'text-zinc-400 italic'}>
-                        {item.zhHant ?? 'Translating...'}
-                      </span>
-                    </p>
-                    {item.translationStatus === 'error' && (
-                      <p className="text-red-500">
-                        Translation failed: {item.translationError}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
+            <>
+              <div>
+                <p className="text-xs font-semibold text-zinc-400 mb-1">Korean (source)</p>
+                <p className="text-sm whitespace-pre-wrap">{koreanText || <span className="text-zinc-400 italic">Waiting for speech...</span>}</p>
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-zinc-400 mb-1">English</p>
+                <p className="text-sm whitespace-pre-wrap">{enText || <span className="text-zinc-400 italic">—</span>}</p>
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-zinc-400 mb-1">中文</p>
+                <p className="text-sm whitespace-pre-wrap">{zhText || <span className="text-zinc-400 italic">—</span>}</p>
+              </div>
+            </>
           )}
         </div>
       </section>
@@ -505,35 +422,13 @@ export default function AudioChunkTest() {
                   status={sampleRate === null ? undefined : sampleRate === 48000 ? 'ok' : 'error'}
                 />
                 <Row label="Chunk Duration" value={`${CHUNK_MS}ms`} />
-                <Row
-                  label="Chunk Count"
-                  value={chunkCount > 0 ? String(chunkCount) : '—'}
-                  highlight={chunkCount > 0}
-                />
-                <Row
-                  label="Latest Chunk Size"
-                  value={latestChunkSize !== null ? `${latestChunkSize} bytes` : '—'}
-                  status={
-                    latestChunkSize !== null
-                      ? latestChunkSize === expectedSize ? 'ok' : 'warn'
-                      : undefined
-                  }
-                />
-                <Row
-                  label="Sequence"
-                  value={
-                    chunkCount === 0
-                      ? '—'
-                      : sequenceOk ? `1 → ${chunkCount} OK` : 'SEQUENCE ERROR'
-                  }
-                  status={chunkCount === 0 ? undefined : sequenceOk ? 'ok' : 'error'}
-                />
+                <Row label="Chunk Count" value={chunkCount > 0 ? String(chunkCount) : '—'} />
                 <Row
                   label="Client → Server"
                   value={lastAckLatency !== null ? `${lastAckLatency}ms` : '—'}
                 />
                 <Row
-                  label="Total Chunks"
+                  label="Total Chunks (server)"
                   value={serverTotalChunks > 0 ? String(serverTotalChunks) : '—'}
                 />
                 <Row
@@ -568,19 +463,16 @@ function Badge({ active, label }: { active: boolean; label: string }) {
 function Row({
   label,
   value,
-  highlight,
   status,
 }: {
   label: string;
   value: string;
-  highlight?: boolean;
   status?: 'ok' | 'warn' | 'error';
 }) {
   let valueClass = 'text-zinc-900 dark:text-zinc-100';
   if (status === 'ok') valueClass = 'text-green-600 dark:text-green-400 font-medium';
   if (status === 'warn') valueClass = 'text-yellow-600 dark:text-yellow-400 font-medium';
   if (status === 'error') valueClass = 'text-red-600 dark:text-red-400 font-bold';
-  if (highlight) valueClass += ' tabular-nums';
 
   return (
     <tr>

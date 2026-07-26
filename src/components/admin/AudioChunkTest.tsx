@@ -16,9 +16,21 @@ import type {
 const OUTPUT_SAMPLE_RATE = 24000;
 const CHUNK_MS = 100;
 const WS_URL = 'ws://localhost:3001';
-const SESSION_CODE = 'TEST-001';
+
+function generateSessionCode(): string {
+  const now = new Date();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let suffix = '';
+  for (let i = 0; i < 4; i++) {
+    suffix += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `${mm}${dd}-${suffix}`;
+}
 
 export default function AudioChunkTest() {
+  const [sessionCode] = useState(() => generateSessionCode());
   const [isRunning, setIsRunning] = useState(false);
   const [sampleRate, setSampleRate] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -234,7 +246,7 @@ export default function AudioChunkTest() {
 
             const msg: AudioChunkMessage = {
               type: 'audio.chunk',
-              sessionCode: SESSION_CODE,
+              sessionCode,
               seq: chunkIndex,
               capturedAt,
               chunkMs: CHUNK_MS,
@@ -262,10 +274,10 @@ export default function AudioChunkTest() {
     return () => { stop(); };
   }, [stop]);
 
-  const [viewerUrl, setViewerUrl] = useState(`/watch/${SESSION_CODE}`);
+  const [viewerUrl, setViewerUrl] = useState(`/watch/${sessionCode}`);
   useEffect(() => {
-    setViewerUrl(`${window.location.origin}/watch/${SESSION_CODE}`);
-  }, []);
+    setViewerUrl(`${window.location.origin}/watch/${sessionCode}`);
+  }, [sessionCode]);
 
   const [copied, setCopied] = useState(false);
   const copyUrl = () => {
@@ -292,7 +304,7 @@ export default function AudioChunkTest() {
           <div className="min-w-0 flex-1 space-y-2">
             <div>
               <p className="text-xs text-zinc-400">Session Code</p>
-              <p className="font-mono text-sm font-semibold">{SESSION_CODE}</p>
+              <p className="font-mono text-sm font-semibold">{sessionCode}</p>
             </div>
             <div>
               <p className="text-xs text-zinc-400">Viewer URL</p>

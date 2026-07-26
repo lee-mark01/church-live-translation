@@ -30,7 +30,10 @@ function generateSessionCode(): string {
 }
 
 export default function AudioChunkTest() {
-  const [sessionCode] = useState(() => generateSessionCode());
+  const [sessionCode, setSessionCode] = useState('');
+  useEffect(() => {
+    setSessionCode(generateSessionCode());
+  }, []);
   const [isRunning, setIsRunning] = useState(false);
   const [sampleRate, setSampleRate] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -268,7 +271,7 @@ export default function AudioChunkTest() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [sessionCode]);
 
   useEffect(() => {
     return () => { stop(); };

@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { TranslateClient } from '../openai/translateClient';
+import { SessionLogger } from '../session/sessionLogger';
 import type {
   AudioChunkMessage,
   AudioChunkAck,
@@ -109,6 +110,7 @@ wss.on('connection', (ws: WebSocket) => {
   let expectedSeq = 1;
   let totalChunks = 0;
   let droppedChunks = 0;
+  let logger: SessionLogger | null = null;
 
   // Translation sessions (one per output language)
   const translateSessions = new Map<OutputLanguage, TranslateClient>();
@@ -156,6 +158,9 @@ wss.on('connection', (ws: WebSocket) => {
       }
       translateSessions.clear();
 
+      // Save session log
+      logger?.save();
+
       sendToAdmin<AudioStopAck>({ type: 'audio.stop.ack' });
       console.log('[ws] safe stop complete, sent ack');
       return;
@@ -171,6 +176,7 @@ wss.on('connection', (ws: WebSocket) => {
       role = 'admin';
       adminSessionCode = audioMsg.sessionCode;
       adminClients.set(adminSessionCode, ws);
+      logger = new SessionLogger(adminSessionCode);
       console.log(`[ws] admin identified for session=${adminSessionCode}`);
 
       notifyAdminViewerCount(adminSessionCode);
@@ -230,6 +236,7 @@ wss.on('connection', (ws: WebSocket) => {
         client.disconnect();
       }
       translateSessions.clear();
+      logger?.save();
     } else if (role === 'viewer') {
       removeViewer(ws);
     } else {
@@ -275,6 +282,7 @@ wss.on('connection', (ws: WebSocket) => {
     if (language === 'en') {
       client.on('input_delta', (text) => {
         sendToAdmin<TranscriptDelta>({ type: 'transcript.delta', text });
+        logger?.appendInput(text);
       });
     }
 
@@ -286,6 +294,9 @@ wss.on('connection', (ws: WebSocket) => {
         language,
         text,
       });
+
+      // Accumulate for session log
+      logger?.appendOutput(language, text);
 
       // Broadcast to viewers of this language
       if (adminSessionCode) {

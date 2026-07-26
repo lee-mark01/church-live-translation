@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { TranslateClient } from '../openai/translateClient';
+import { retranslateKorean } from '../openai/retranslate';
 import { SessionLogger } from '../session/sessionLogger';
 import type {
   AudioChunkMessage,
@@ -16,6 +17,12 @@ import type {
   OutputLanguage,
   SubtitleDelta,
   SubtitleHistory,
+  SubtitleCorrection,
+  AdminSentence,
+  SentenceComplete,
+  CorrectionRequest,
+  CorrectionResult,
+  ViewerSentence,
 } from '../../lib/types/audio';
 import { LANGUAGE_CODES } from '../../lib/languages';
 
@@ -27,6 +34,30 @@ console.log(`[ws] WebSocket server listening on ws://localhost:${PORT}`);
 
 if (!OPENAI_API_KEY) {
   console.warn('[ws] OPENAI_API_KEY not set — translation will be disabled');
+}
+
+// Sentence boundary detection
+const SENTENCE_END_RE = /[.!?。？！]\s*/;
+
+function splitIntoSentences(text: string): string[] {
+  const results: string[] = [];
+  let remaining = text;
+  while (remaining) {
+    const match = remaining.match(SENTENCE_END_RE);
+    if (match && match.index !== undefined) {
+      const end = match.index + match[0].length;
+      results.push(remaining.slice(0, end));
+      remaining = remaining.slice(end);
+    } else {
+      results.push(remaining);
+      break;
+    }
+  }
+  return results.filter((s) => s.trim());
+}
+
+function isSentenceComplete(text: string): boolean {
+  return /[.!?。？！]\s*$/.test(text);
 }
 
 // --- Viewer management ---
@@ -62,11 +93,10 @@ function removeViewer(ws: WebSocket): void {
   }
 }
 
-function broadcastToViewers(sessionCode: string, language: ViewerLanguage, text: string): void {
+function broadcastToViewers(sessionCode: string, language: ViewerLanguage, msg: object): void {
   const clients = viewers.get(sessionCode);
   if (!clients || clients.length === 0) return;
 
-  const msg: SubtitleDelta = { type: 'subtitle.delta', text };
   const payload = JSON.stringify(msg);
 
   for (const client of clients) {
@@ -76,19 +106,64 @@ function broadcastToViewers(sessionCode: string, language: ViewerLanguage, text:
   }
 }
 
-// --- Accumulated subtitle text per session per language ---
-const subtitleTexts = new Map<string, Record<ViewerLanguage, string>>();
+function broadcastToAllViewers(sessionCode: string, msg: object): void {
+  const clients = viewers.get(sessionCode);
+  if (!clients || clients.length === 0) return;
 
-function appendSubtitleText(sessionCode: string, language: ViewerLanguage, text: string): void {
-  if (!subtitleTexts.has(sessionCode)) {
-    const empty = Object.fromEntries(LANGUAGE_CODES.map((c) => [c, ''])) as Record<ViewerLanguage, string>;
-    subtitleTexts.set(sessionCode, empty);
+  const payload = JSON.stringify(msg);
+  for (const client of clients) {
+    if (client.ws.readyState !== WebSocket.OPEN) continue;
+    client.ws.send(payload);
   }
-  subtitleTexts.get(sessionCode)![language] += text;
 }
 
-function getSubtitleText(sessionCode: string, language: ViewerLanguage): string {
-  return subtitleTexts.get(sessionCode)?.[language] ?? '';
+// --- Sentence storage per session ---
+interface SessionSentences {
+  sentences: AdminSentence[];
+  koreanBuffer: string;       // accumulates input_delta until sentence boundary
+  translationBuffers: Record<OutputLanguage, string>;  // per-language accumulator
+  translationSentenceIdx: Record<OutputLanguage, number>; // which sentence index each lang is filling
+  sentenceCounter: number;
+  // Full accumulated text per language (for history on language switch)
+  fullTexts: Record<OutputLanguage, string>;
+}
+
+const sessionData = new Map<string, SessionSentences>();
+
+function getOrCreateSessionData(sessionCode: string): SessionSentences {
+  if (!sessionData.has(sessionCode)) {
+    sessionData.set(sessionCode, {
+      sentences: [],
+      koreanBuffer: '',
+      translationBuffers: Object.fromEntries(LANGUAGE_CODES.map((c) => [c, ''])) as Record<OutputLanguage, string>,
+      translationSentenceIdx: Object.fromEntries(LANGUAGE_CODES.map((c) => [c, 0])) as Record<OutputLanguage, number>,
+      sentenceCounter: 0,
+      fullTexts: Object.fromEntries(LANGUAGE_CODES.map((c) => [c, ''])) as Record<OutputLanguage, string>,
+    });
+  }
+  return sessionData.get(sessionCode)!;
+}
+
+function getViewerHistory(sessionCode: string, language: ViewerLanguage): { sentences: ViewerSentence[]; streamingText: string } {
+  const data = sessionData.get(sessionCode);
+  if (!data) return { sentences: [], streamingText: '' };
+
+  const sentences = data.sentences
+    .filter((s) => s.translations[language])
+    .map((s) => ({
+      id: s.id,
+      text: s.translations[language]!,
+      corrected: s.corrected,
+    }));
+
+  // Calculate streaming text: full accumulated text minus what's already in sentences
+  const sentenceText = sentences.map((s) => s.text).join('');
+  const fullText = data.fullTexts[language] || '';
+  const streamingText = fullText.startsWith(sentenceText)
+    ? fullText.slice(sentenceText.length)
+    : data.translationBuffers[language] || '';
+
+  return { sentences, streamingText };
 }
 
 // --- Admin tracking ---
@@ -132,7 +207,7 @@ wss.on('connection', (ws: WebSocket) => {
   // Translation sessions (one per output language)
   const translateSessions = new Map<OutputLanguage, TranslateClient>();
 
-  ws.on('message', (raw: Buffer) => {
+  ws.on('message', async (raw: Buffer) => {
     let msg: { type: string; [key: string]: unknown };
     try {
       msg = JSON.parse(raw.toString());
@@ -147,12 +222,10 @@ wss.on('connection', (ws: WebSocket) => {
       role = 'viewer';
       addViewer(join.sessionCode, { ws, language: join.language });
 
-      // Send accumulated subtitle history
-      const history = getSubtitleText(join.sessionCode, join.language);
-      if (history) {
-        const historyMsg: SubtitleHistory = { type: 'subtitle.history', text: history };
-        ws.send(JSON.stringify(historyMsg));
-      }
+      // Send sentence-based history + streaming text
+      const history = getViewerHistory(join.sessionCode, join.language);
+      const historyMsg: SubtitleHistory = { type: 'subtitle.history', ...history };
+      ws.send(JSON.stringify(historyMsg));
       return;
     }
 
@@ -166,12 +239,63 @@ wss.on('connection', (ws: WebSocket) => {
           console.log(`[ws] viewer changed language to ${change.language}`);
           notifyAdminViewerCount(sessionCode);
 
-          // Send accumulated subtitle history for the new language
-          const history = getSubtitleText(sessionCode, change.language);
-          const historyMsg: SubtitleHistory = { type: 'subtitle.history', text: history };
+          // Send sentence-based history + streaming text for the new language
+          const history = getViewerHistory(sessionCode, change.language);
+          const historyMsg: SubtitleHistory = { type: 'subtitle.history', ...history };
           ws.send(JSON.stringify(historyMsg));
           break;
         }
+      }
+      return;
+    }
+
+    // --- Admin correction request ---
+    if (msg.type === 'correction.request') {
+      const req = msg as unknown as CorrectionRequest;
+      if (!adminSessionCode || !OPENAI_API_KEY) return;
+
+      const data = sessionData.get(adminSessionCode);
+      if (!data) return;
+
+      const sentence = data.sentences.find((s) => s.id === req.sentenceId);
+      if (!sentence) {
+        console.warn(`[ws] correction: sentence ${req.sentenceId} not found`);
+        return;
+      }
+
+      console.log(`[ws] correction requested: ${req.sentenceId} "${sentence.korean}" → "${req.correctedKorean}"`);
+
+      try {
+        // Re-translate via Chat Completions API
+        const translations = await retranslateKorean(OPENAI_API_KEY, req.correctedKorean, LANGUAGE_CODES);
+
+        // Update stored sentence
+        sentence.korean = req.correctedKorean;
+        sentence.translations = translations;
+        sentence.corrected = true;
+
+        // Send result to admin
+        sendToAdmin<CorrectionResult>({
+          type: 'correction.result',
+          sentenceId: req.sentenceId,
+          korean: req.correctedKorean,
+          translations,
+        });
+
+        // Broadcast correction to viewers (per language)
+        for (const lang of LANGUAGE_CODES) {
+          if (translations[lang]) {
+            broadcastToViewers(adminSessionCode, lang, {
+              type: 'subtitle.correction',
+              sentenceId: req.sentenceId,
+              text: translations[lang],
+            } satisfies SubtitleCorrection);
+          }
+        }
+
+        console.log(`[ws] correction applied: ${req.sentenceId}`);
+      } catch (err) {
+        console.error('[ws] correction failed:', err);
       }
       return;
     }
@@ -206,6 +330,7 @@ wss.on('connection', (ws: WebSocket) => {
       adminSessionCode = audioMsg.sessionCode;
       adminClients.set(adminSessionCode, ws);
       logger = new SessionLogger(adminSessionCode);
+      getOrCreateSessionData(adminSessionCode);
       console.log(`[ws] admin identified for session=${adminSessionCode}`);
 
       notifyAdminViewerCount(adminSessionCode);
@@ -313,6 +438,66 @@ wss.on('connection', (ws: WebSocket) => {
       client.on('input_delta', (text) => {
         sendToAdmin<TranscriptDelta>({ type: 'transcript.delta', text });
         logger?.appendInput(text);
+
+        // Sentence segmentation for Korean
+        if (adminSessionCode) {
+          const data = getOrCreateSessionData(adminSessionCode);
+          data.koreanBuffer += text;
+
+          // Check if we have completed sentences
+          while (isSentenceComplete(data.koreanBuffer)) {
+            const parts = splitIntoSentences(data.koreanBuffer);
+            if (parts.length <= 1 && isSentenceComplete(data.koreanBuffer)) {
+              // Entire buffer is one completed sentence
+              const sentenceText = data.koreanBuffer.trim();
+              data.koreanBuffer = '';
+              const id = `s-${++data.sentenceCounter}`;
+              const sentence: AdminSentence = {
+                id,
+                korean: sentenceText,
+                translations: {},
+              };
+              data.sentences.push(sentence);
+              sendToAdmin<SentenceComplete>({ type: 'sentence.complete', sentence });
+              console.log(`[ws] korean sentence finalized: ${id} "${sentenceText}"`);
+              break;
+            } else if (parts.length > 1) {
+              // First part(s) are complete, last may be partial
+              for (let i = 0; i < parts.length - 1; i++) {
+                const sentenceText = parts[i].trim();
+                if (!sentenceText) continue;
+                const id = `s-${++data.sentenceCounter}`;
+                const sentence: AdminSentence = {
+                  id,
+                  korean: sentenceText,
+                  translations: {},
+                };
+                data.sentences.push(sentence);
+                sendToAdmin<SentenceComplete>({ type: 'sentence.complete', sentence });
+                console.log(`[ws] korean sentence finalized: ${id} "${sentenceText}"`);
+              }
+              const lastPart = parts[parts.length - 1];
+              if (isSentenceComplete(lastPart)) {
+                const sentenceText = lastPart.trim();
+                const id = `s-${++data.sentenceCounter}`;
+                const sentence: AdminSentence = {
+                  id,
+                  korean: sentenceText,
+                  translations: {},
+                };
+                data.sentences.push(sentence);
+                sendToAdmin<SentenceComplete>({ type: 'sentence.complete', sentence });
+                console.log(`[ws] korean sentence finalized: ${id} "${sentenceText}"`);
+                data.koreanBuffer = '';
+              } else {
+                data.koreanBuffer = lastPart;
+              }
+              break;
+            } else {
+              break;
+            }
+          }
+        }
       });
     }
 
@@ -325,11 +510,48 @@ wss.on('connection', (ws: WebSocket) => {
         text,
       });
 
-      // Accumulate for session log + subtitle history
+      // Accumulate for session log
       logger?.appendOutput(language, text);
+
       if (adminSessionCode) {
-        appendSubtitleText(adminSessionCode, language, text);
-        broadcastToViewers(adminSessionCode, language, text);
+        // Accumulate full text
+        const data = getOrCreateSessionData(adminSessionCode);
+        data.fullTexts[language] += text;
+
+        // Send delta to viewers
+        broadcastToViewers(adminSessionCode, language, {
+          type: 'subtitle.delta',
+          text,
+        } satisfies SubtitleDelta);
+
+        // Sentence segmentation for translations
+        data.translationBuffers[language] += text;
+
+        // Check for completed translation sentences
+        while (isSentenceComplete(data.translationBuffers[language])) {
+          const parts = splitIntoSentences(data.translationBuffers[language]);
+          const completeParts = isSentenceComplete(data.translationBuffers[language])
+            ? parts
+            : parts.slice(0, -1);
+          const remaining = isSentenceComplete(data.translationBuffers[language])
+            ? ''
+            : parts[parts.length - 1] || '';
+
+          for (const part of completeParts) {
+            const trimmed = part.trim();
+            if (!trimmed) continue;
+            const idx = data.translationSentenceIdx[language];
+            if (idx < data.sentences.length) {
+              data.sentences[idx].translations[language] = trimmed;
+              console.log(`[ws] translation [${language}] filled for ${data.sentences[idx].id}: "${trimmed}"`);
+              // Notify admin of updated sentence
+              sendToAdmin<SentenceComplete>({ type: 'sentence.complete', sentence: data.sentences[idx] });
+            }
+            data.translationSentenceIdx[language]++;
+          }
+          data.translationBuffers[language] = remaining;
+          if (!remaining) break;
+        }
       }
     });
 

@@ -12,6 +12,9 @@ import type {
   ViewerCountUpdate,
   ServerMessage,
   OutputLanguage,
+  AdminSentence,
+  SentenceComplete,
+  CorrectionResult,
 } from '@/lib/types/audio';
 import { LANGUAGES, LANGUAGE_CODES, LANGUAGE_LABELS } from '@/lib/languages';
 
@@ -61,6 +64,12 @@ export default function AudioChunkTest() {
   const [koreanText, setKoreanText] = useState('');
   const [langText, setLangText] = useState<Record<OutputLanguage, string>>(langRecord(''));
   const [langLatency, setLangLatency] = useState<Record<OutputLanguage, number | null>>(langRecord(null));
+
+  // Sentence correction state
+  const [sentences, setSentences] = useState<AdminSentence[]>([]);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
+  const [correcting, setCorrecting] = useState(false);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -123,6 +132,7 @@ export default function AudioChunkTest() {
       setKoreanText('');
       setLangText(langRecord(''));
       setLangLatency(langRecord(null));
+      setSentences([]);
       expectedIndexRef.current = 1;
 
       // 1. Connect WebSocket
@@ -174,6 +184,32 @@ export default function AudioChunkTest() {
           }
           case 'viewer.count': {
             setViewerCount(msg as ViewerCountUpdate);
+            break;
+          }
+          case 'sentence.complete': {
+            const sc = msg as SentenceComplete;
+            setSentences((prev) => {
+              const idx = prev.findIndex((s) => s.id === sc.sentence.id);
+              if (idx >= 0) {
+                const updated = [...prev];
+                updated[idx] = sc.sentence;
+                return updated;
+              }
+              return [...prev, sc.sentence];
+            });
+            break;
+          }
+          case 'correction.result': {
+            const cr = msg as CorrectionResult;
+            setSentences((prev) =>
+              prev.map((s) =>
+                s.id === cr.sentenceId
+                  ? { ...s, korean: cr.korean, translations: cr.translations, corrected: true }
+                  : s,
+              ),
+            );
+            setCorrecting(false);
+            setEditingId(null);
             break;
           }
         }
@@ -286,6 +322,32 @@ export default function AudioChunkTest() {
   };
 
   const [diagOpen, setDiagOpen] = useState(false);
+
+  // Correction handlers
+  const startEdit = (sentence: AdminSentence) => {
+    setEditingId(sentence.id);
+    setEditText(sentence.korean);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditText('');
+  };
+
+  const submitCorrection = () => {
+    if (!editingId || !editText.trim() || !wsRef.current) return;
+    const original = sentences.find((s) => s.id === editingId);
+    if (original && original.korean === editText.trim()) {
+      cancelEdit();
+      return;
+    }
+    setCorrecting(true);
+    wsRef.current.send(JSON.stringify({
+      type: 'correction.request',
+      sentenceId: editingId,
+      correctedKorean: editText.trim(),
+    }));
+  };
 
   return (
     <div className="mx-auto max-w-2xl space-y-6 p-6">
@@ -408,6 +470,89 @@ export default function AudioChunkTest() {
           )}
         </div>
       </section>
+
+      {/* Sentence Correction Panel */}
+      {sentences.length > 0 && (
+        <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+            문장 수정
+          </h2>
+          <p className="mb-3 text-xs text-zinc-400">
+            잘못 인식된 문장을 클릭해서 수정하면 번역이 자동으로 다시 됩니다.
+          </p>
+          <div className="space-y-2 max-h-[400px] overflow-y-auto">
+            {sentences.map((sentence) => (
+              <div
+                key={sentence.id}
+                className={`rounded-md border p-3 transition-colors ${
+                  sentence.corrected
+                    ? 'border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/20'
+                    : 'border-zinc-200 dark:border-zinc-700'
+                } ${editingId === sentence.id ? '' : 'cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800'}`}
+              >
+                {editingId === sentence.id ? (
+                  // Edit mode
+                  <div className="space-y-2">
+                    <input
+                      type="text"
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') submitCorrection();
+                        if (e.key === 'Escape') cancelEdit();
+                      }}
+                      className="w-full rounded border border-blue-300 bg-white px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500 dark:border-blue-600 dark:bg-zinc-800"
+                      autoFocus
+                      disabled={correcting}
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={submitCorrection}
+                        disabled={correcting}
+                        className="rounded bg-blue-600 px-3 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {correcting ? '번역 중...' : '수정'}
+                      </button>
+                      <button
+                        onClick={cancelEdit}
+                        disabled={correcting}
+                        className="rounded bg-zinc-200 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-300 dark:bg-zinc-700 dark:text-zinc-300 disabled:opacity-50"
+                      >
+                        취소
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  // Display mode
+                  <div onClick={() => startEdit(sentence)}>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-zinc-300 dark:text-zinc-600">{sentence.id}</span>
+                      {sentence.corrected && (
+                        <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-800 dark:text-amber-200">
+                          수정됨
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm font-medium mt-0.5">{sentence.korean}</p>
+                    {Object.keys(sentence.translations).length > 0 && (
+                      <div className="mt-1 space-y-0.5">
+                        {LANGUAGES.map(({ code }) =>
+                          sentence.translations[code] ? (
+                            <p key={code} className="text-xs text-zinc-500 dark:text-zinc-400">
+                              <span className="font-medium text-zinc-400 dark:text-zinc-500">{code.toUpperCase()}</span>{' '}
+                              {sentence.translations[code]}
+                            </p>
+                          ) : null,
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Developer Diagnostics (collapsible) */}
       <section className="rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">

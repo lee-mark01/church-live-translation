@@ -55,6 +55,21 @@ export interface SubtitleDelta {
 /** Server → Browser (viewer): full subtitle history on language change */
 export interface SubtitleHistory {
   type: 'subtitle.history';
+  sentences: ViewerSentence[];
+  streamingText: string; // text not yet finalized into sentences
+}
+
+/** A sentence as seen by the viewer */
+export interface ViewerSentence {
+  id: string;
+  text: string;
+  corrected?: boolean;
+}
+
+/** Server → Browser (viewer): a sentence was corrected — replace it */
+export interface SubtitleCorrection {
+  type: 'subtitle.correction';
+  sentenceId: string;
   text: string;
 }
 
@@ -71,6 +86,35 @@ export interface TranslateLatency {
   type: 'translate.latency';
   language: OutputLanguage;
   ms: number;
+}
+
+/** Server → Browser (admin): a sentence has been finalized with translations */
+export interface SentenceComplete {
+  type: 'sentence.complete';
+  sentence: AdminSentence;
+}
+
+/** A finalized sentence with all translations */
+export interface AdminSentence {
+  id: string;
+  korean: string;
+  translations: Partial<Record<OutputLanguage, string>>;
+  corrected?: boolean;
+}
+
+/** Browser → Server (admin): submit a correction */
+export interface CorrectionRequest {
+  type: 'correction.request';
+  sentenceId: string;
+  correctedKorean: string;
+}
+
+/** Server → Browser (admin): correction completed */
+export interface CorrectionResult {
+  type: 'correction.result';
+  sentenceId: string;
+  korean: string;
+  translations: Record<OutputLanguage, string>;
 }
 
 // OutputLanguage is defined in and re-exported from '@/lib/languages'
@@ -109,7 +153,9 @@ export type ServerMessage =
   | TranslationDelta
   | TranslateConnectionStatus
   | TranslateLatency
-  | ViewerCountUpdate;
+  | ViewerCountUpdate
+  | SentenceComplete
+  | CorrectionResult;
 
 /** Union of all server → viewer browser messages */
-export type ViewerMessage = SubtitleDelta | SubtitleHistory;
+export type ViewerMessage = SubtitleDelta | SubtitleHistory | SubtitleCorrection;

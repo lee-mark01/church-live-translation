@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ViewerLanguage, ViewerMessage } from '@/lib/types/audio';
+import type { ViewerLanguage, ViewerMessage, ViewerSentence } from '@/lib/types/audio';
 import { LANGUAGES, LANGUAGE_LABELS } from '@/lib/languages';
 
 const WS_URL = 'ws://localhost:3001';
@@ -12,31 +12,6 @@ const FONT_SIZE_CLASSES: Record<FontSize, string> = {
   md: 'text-2xl sm:text-3xl leading-relaxed',
   lg: 'text-3xl sm:text-4xl md:text-5xl leading-snug',
 };
-
-// Sentence boundary regex for Korean/English/Chinese
-const SENTENCE_END = /[.!?。？！]\s*/;
-
-function splitSentences(text: string): string[] {
-  const parts = text.split(SENTENCE_END);
-  // Re-split with capturing the delimiters
-  const segments: string[] = [];
-  let remaining = text;
-  for (const part of parts) {
-    if (!part) continue;
-    const idx = remaining.indexOf(part) + part.length;
-    // Find the delimiter after this part
-    const afterPart = remaining.slice(idx);
-    const delimMatch = afterPart.match(/^[.!?。？！]\s*/);
-    if (delimMatch) {
-      segments.push(part + delimMatch[0]);
-      remaining = remaining.slice(idx + delimMatch[0].length);
-    } else {
-      segments.push(part);
-      remaining = remaining.slice(idx);
-    }
-  }
-  return segments.filter((s) => s.trim());
-}
 
 // --- Wake Lock hook ---
 function useWakeLock() {
@@ -69,13 +44,18 @@ function useWakeLock() {
 export default function SubtitleViewer({ sessionCode }: { sessionCode: string }) {
   const [language, setLanguage] = useState<ViewerLanguage>('en');
   const [connected, setConnected] = useState(false);
-  const [text, setText] = useState('');
+  const [sentences, setSentences] = useState<ViewerSentence[]>([]);
+  const [streamingText, setStreamingText] = useState('');
   const [fontSize, setFontSize] = useState<FontSize>('md');
   const [showControls, setShowControls] = useState(true);
   const [isAutoScroll, setIsAutoScroll] = useState(true);
+  const [correctedIds, setCorrectedIds] = useState<Set<string>>(new Set());
+  const [toast, setToast] = useState<{ sentenceId: string; text: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const sentenceRefs = useRef<Map<string, HTMLParagraphElement>>(new Map());
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useWakeLock();
 
@@ -100,7 +80,7 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
     if (isAutoScroll && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [text, isAutoScroll]);
+  }, [sentences, streamingText, isAutoScroll]);
 
   // Detect manual scroll
   const handleScroll = useCallback(() => {
@@ -115,6 +95,19 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
+  }, []);
+
+  const scrollToSentence = useCallback((sentenceId: string) => {
+    const el = sentenceRefs.current.get(sentenceId);
+    const container = scrollRef.current;
+    if (el && container) {
+      setIsAutoScroll(false);
+      const containerRect = container.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      const targetScroll = container.scrollTop + (elRect.top - containerRect.top) - container.clientHeight / 2 + el.offsetHeight / 2;
+      container.scrollTo({ top: targetScroll, behavior: 'smooth' });
+    }
+    setToast(null);
   }, []);
 
   const connect = useCallback((lang: ViewerLanguage) => {
@@ -137,10 +130,37 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data) as ViewerMessage;
-      if (msg.type === 'subtitle.delta') {
-        setText((prev) => prev + msg.text);
-      } else if (msg.type === 'subtitle.history') {
-        setText(msg.text);
+      switch (msg.type) {
+        case 'subtitle.delta':
+          setStreamingText((prev) => prev + msg.text);
+          break;
+        case 'subtitle.history':
+          setSentences(msg.sentences);
+          setStreamingText(msg.streamingText || '');
+          break;
+        case 'subtitle.correction': {
+          setSentences((prev) =>
+            prev.map((s) =>
+              s.id === msg.sentenceId
+                ? { ...s, text: msg.text, corrected: true }
+                : s,
+            ),
+          );
+          // Trigger highlight animation
+          setCorrectedIds((prev) => new Set(prev).add(msg.sentenceId));
+          setTimeout(() => {
+            setCorrectedIds((prev) => {
+              const next = new Set(prev);
+              next.delete(msg.sentenceId);
+              return next;
+            });
+          }, 3000);
+          // Show toast
+          if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+          setToast({ sentenceId: msg.sentenceId, text: msg.text });
+          toastTimerRef.current = setTimeout(() => setToast(null), 5000);
+          break;
+        }
       }
     };
 
@@ -195,10 +215,7 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
     scheduleHideControls();
   };
 
-  // Split text into sentences for display
-  const sentences = splitSentences(text);
-  const currentSentence = sentences.length > 0 ? sentences[sentences.length - 1] : '';
-  const completedSentences = sentences.slice(0, -1);
+  const hasContent = sentences.length > 0 || streamingText;
 
   return (
     <div
@@ -252,26 +269,38 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="flex flex-1 flex-col justify-end overflow-y-auto px-5 pb-12 pt-16 sm:px-8 md:px-12 lg:px-20"
+        className="flex flex-1 flex-col overflow-y-auto px-5 pb-12 pt-16 sm:px-8 md:px-12 lg:px-20"
       >
-        {text ? (
+        {/* Spacer pushes content to bottom when short, disappears when content overflows */}
+        <div className="flex-1" />
+        {hasContent ? (
           <div className="space-y-4">
-            {/* Completed sentences — faded */}
-            {completedSentences.map((sentence, i) => (
+            {/* Finalized sentences */}
+            {sentences.map((sentence) => (
               <p
-                key={i}
-                className={`${FONT_SIZE_CLASSES[fontSize]} font-medium text-[#F5F0E8] opacity-50 transition-opacity duration-200`}
+                key={sentence.id}
+                ref={(el) => {
+                  if (el) sentenceRefs.current.set(sentence.id, el);
+                  else sentenceRefs.current.delete(sentence.id);
+                }}
+                className={`${FONT_SIZE_CLASSES[fontSize]} font-medium transition-all duration-500 ${
+                  correctedIds.has(sentence.id)
+                    ? 'text-amber-300'
+                    : sentence.corrected
+                      ? 'text-amber-200/70'
+                      : 'text-[#F5F0E8] opacity-50'
+                }`}
               >
-                {sentence}
+                {sentence.text}
               </p>
             ))}
 
-            {/* Current sentence — full brightness */}
-            {currentSentence && (
+            {/* Currently streaming text — full brightness */}
+            {streamingText && (
               <p
                 className={`${FONT_SIZE_CLASSES[fontSize]} font-medium text-[#F5F0E8]`}
               >
-                {currentSentence}
+                {streamingText}
               </p>
             )}
           </div>
@@ -281,6 +310,18 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
           </p>
         )}
       </div>
+
+      {/* Toast notification for corrections */}
+      {toast && (
+        <div
+          onClick={(e) => { e.stopPropagation(); scrollToSentence(toast.sentenceId); }}
+          className="absolute top-14 left-1/2 z-20 -translate-x-1/2 animate-slide-down cursor-pointer rounded-lg bg-amber-500/90 px-4 py-2.5 shadow-lg backdrop-blur transition-transform hover:scale-105"
+          style={{ maxWidth: 'calc(100% - 2rem)' }}
+        >
+          <p className="text-xs font-medium text-black/70">Translation updated</p>
+          <p className="mt-0.5 text-sm font-medium text-black line-clamp-2">{toast.text}</p>
+        </div>
+      )}
 
       {/* Jump to live button */}
       {!isAutoScroll && (

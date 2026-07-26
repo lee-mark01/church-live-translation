@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:ws": "node --env-file=.env --import tsx src/server/ws/server.ts",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

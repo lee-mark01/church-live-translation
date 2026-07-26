@@ -28,8 +28,8 @@
 |------|------|
 | Frontend | Next.js (App Router), React, TypeScript, Tailwind CSS |
 | Backend | Next.js API Routes + standalone WebSocket server (`src/server`) |
-| STT | Server-side realtime STT provider (첫 번째 후보: OpenAI Realtime Transcription, 미확정) |
-| Translation | OpenAI GPT API |
+| STT | OpenAI Realtime API (GA) — `gpt-4o-transcribe`, transcription session |
+| Translation | OpenAI Responses API — `gpt-4.1-mini`, Structured Outputs |
 | Database | PostgreSQL |
 | Deployment | AWS EC2 |
 
@@ -41,8 +41,19 @@ src/
     admin/       # 관리자 페이지
     watch/       # 시청자 자막 페이지 (/watch/[sessionCode])
   components/    # React 컴포넌트
-  lib/           # 공유 타입 및 유틸리티
-  server/        # 백엔드 전용 코드 (WebSocket 서버, 오디오 파이프라인)
+    admin/       # 관리자 페이지 컴포넌트
+    viewer/      # 시청자 페이지 컴포넌트
+  lib/           # 프론트/서버 공유 코드
+    audio/       # 오디오 유틸리티
+    time/        # 시간 유틸리티
+    types/       # 공유 타입/인터페이스
+    logger/      # 로깅 유틸리티
+  server/        # 백엔드 전용 코드
+    ws/          # WebSocket 서버
+    openai/      # STT 연동
+    translation/ # 번역 연동
+    session/     # 세션 관리
+    db/          # DB 저장
 docs/            # 아키텍처, 개발 로그, 테스트 계획
 public/          # 정적 파일
 ```
@@ -53,10 +64,23 @@ public/          # 정적 파일
 
 ```bash
 npm install
-npm run dev
 ```
 
-http://localhost:3000 에서 확인.
+`.env` 파일을 프로젝트 루트에 생성:
+
+```
+OPENAI_API_KEY=sk-...
+```
+
+서버 실행 (터미널 2개):
+
+```bash
+npm run dev      # Next.js 프론트엔드 (localhost:3000)
+npm run dev:ws   # WebSocket 서버 (localhost:3001)
+```
+
+- 관리자 콘솔: http://localhost:3000/admin (QR 코드 + Start/Stop + STT + 번역)
+- 시청자 자막: http://localhost:3000/watch/TEST-001 (또는 admin QR 스캔)
 
 ## 오디오 셋업
 

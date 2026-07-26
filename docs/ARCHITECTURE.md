@@ -44,33 +44,70 @@ STT/Translation 결과
 
 ### 1. Audio Capture (브라우저)
 
-- `/admin` 페이지에서 브라우저가 USB 오디오 인터페이스의 음성을 캡처
+- `/admin` (Live Translation Admin 콘솔) 에서 브라우저가 USB 오디오 인터페이스의 음성을 캡처
 - 브라우저는 외부 STT provider에 직접 연결하지 않음
 - 캡처한 audio chunk를 WebSocket으로 우리 서버에 전송
+- 세션 QR 코드 + 접속 URL을 표시하여 viewer가 스캔/접속 가능
 
 ### 2. Speech-to-Text (서버)
 
-- 서버가 STT provider에 연결하여 realtime 한국어 음성 인식 수행
-- STT provider는 미확정 (첫 번째 후보: OpenAI Realtime Transcription)
+- 서버가 OpenAI Realtime API (GA)에 WebSocket으로 연결하여 realtime 한국어 음성 인식 수행
+- 연결: `wss://api.openai.com/v1/realtime?intent=transcription`
+- 세션 타입: `transcription` (전사 전용)
+- 전사 모델: `gpt-4o-transcribe`
+- 오디오 포맷: PCM16 mono 24kHz (`audio/pcm`)
+- turn_detection: `null` (수동 commit — RMS 기반 침묵 감지)
 - Partial(중간) 결과: admin 페이지에만 표시
 - Final 결과: 번역 트리거
 
+#### RMS 기반 발화 감지 + 수동 commit
+
+서버가 각 audio chunk의 RMS를 추적하여 발화/침묵을 판별하고, 침묵 지속 시 commit.
+
+```
+무음 chunk (RMS < 0.003) + 발화 감지 전 → pre-roll buffer에만 보관 (최근 500ms)
+발화 감지 (RMS ≥ 0.003) → pre-roll flush + buffer에 append 시작
+말 멈춤 후 침묵 1.5초 지속 → commit → final transcript 수신
+```
+
+- Pre-roll buffer (500ms): 말 시작 직전의 무음 chunk를 보관하여 첫 음절 잘림 방지
+- 무음 환각(hallucination) 방지: speech 감지 전에는 OpenAI에 보내지 않음
+- RMS threshold는 입력 장치에 따라 튜닝 필요 (노트북 내장 마이크: 0.003, UMC202HD: 재조정 예정)
+
 ### 3. Translation (GPT)
 
+- API: OpenAI Responses API (`/v1/responses`)
+- 모델: `gpt-4.1-mini`
 - 입력: 한국어 final transcript
-- 번역 전 STT 보정 사전과 관련 용어집을 적용할 수 있음
-- 번역 요청에는 전체 용어집이 아닌, 현재 문장과 관련된 용어만 포함하는 것을 원칙으로 함
-- 출력: 3개 언어 번역
+- 출력: Structured Outputs (JSON Schema, strict)로 3개 언어 번역
   - `en`: English
   - `zh-Hans`: Simplified Chinese / 简体中文
   - `zh-Hant`: Traditional Chinese / 繁體中文
+- 번역 전 STT 보정 사전과 관련 용어집을 적용할 수 있음 (추후)
 - Final 번역만 viewer에게 전달
 
 ### 4. WebSocket 배포
 
-WebSocket 서버가 연결된 클라이언트에 결과를 배포:
-- **Admin (`/admin`)**: audio 입력 상태, 한국어 partial STT, 한국어 final STT, 번역 결과
-- **Viewer (`/watch/[sessionCode]`)**: 선택한 언어의 final 번역 자막만 수신
+WebSocket 서버가 연결된 클라이언트를 role로 구분하여 결과를 배포:
+
+| Role | 식별 | 수신 메시지 |
+|------|------|------------|
+| Admin | 첫 `audio.chunk`의 sessionCode | STT delta/final, translation completed/error, chunk ack |
+| Viewer | `viewer.join` (sessionCode + language) | `subtitle.final` (선택 언어의 번역 텍스트만) |
+
+- 한 sessionCode에 여러 viewer가 붙을 수 있음
+- Viewer는 `viewer.changeLanguage`로 실시간 언어 변경 가능
+- 번역 완료 시 같은 sessionCode의 모든 viewer에게 각자 선택한 언어로 broadcast
+
+#### Stop 안전 종료
+
+Admin이 Stop을 누르면 마지막 문장의 STT/번역/broadcast까지 보호:
+
+```
+audio.stop → flushAndClose(commit + transcript 대기)
+→ pendingTranslations 완료 대기 (최대 3초)
+→ audio.stop.ack → admin WS close
+```
 
 ### 5. 비동기 저장 (PostgreSQL)
 
@@ -89,22 +126,28 @@ src/
     watch/
       [sessionCode]/  # 시청자 자막 페이지
     api/              # Next.js API routes
-  components/         # 공유 React 컴포넌트
-  lib/                # 공유 타입, 상수, 유틸리티
-    types.ts          # 공유 TypeScript 인터페이스
+  components/         # React 컴포넌트
+    admin/            # 관리자 페이지 컴포넌트
+    viewer/           # 시청자 페이지 컴포넌트
+  lib/                # 프론트/서버 공유 코드
+    audio/            # 오디오 관련 유틸리티
+    time/             # 시간 관련 유틸리티
+    types/            # 공유 TypeScript 타입/인터페이스
+    logger/           # 로깅 유틸리티
   server/             # 백엔드 전용 코드
-    ws-server.ts      # WebSocket 서버
-    audio-relay.ts    # 브라우저에서 받은 audio chunk 검증/전달 처리
-    stt.ts            # STT provider 연동
-    translate.ts      # GPT 번역 연동
+    ws/               # WebSocket 서버
+    openai/           # OpenAI Realtime STT 연동 + GPT 번역
+    translation/      # (예정) 번역 관련 유틸리티
+    session/          # 설교 세션 관리
+    db/               # PostgreSQL 비동기 저장
 ```
 
 ### 분리 원칙
 
 - `src/app`: Next.js App Router 기반 페이지, layout, route handler를 관리
-- `src/components`: 주로 브라우저 UI 컴포넌트. 브라우저 API를 사용하는 컴포넌트는 `"use client"`를 명시
-- `src/server`: Node.js 전용 코드 (WebSocket, STT provider 연동, 번역 orchestration, DB 저장)
-- `src/lib`: 프론트/서버에서 공유 가능한 타입, 상수, 순수 유틸리티
+- `src/components`: 브라우저 UI 컴포넌트. `admin/`과 `viewer/`로 역할 분리. 브라우저 API를 사용하는 컴포넌트는 `"use client"`를 명시
+- `src/server`: Node.js 전용 코드. WebSocket(`ws/`), STT(`openai/`), 번역(`translation/`), 세션 관리(`session/`), DB 저장(`db/`)으로 분리
+- `src/lib`: 프론트/서버에서 공유 가능한 유틸리티. 오디오(`audio/`), 시간(`time/`), 타입(`types/`), 로깅(`logger/`)으로 분리
 
 추후 `apps/web` (프론트엔드)과 `apps/api` (백엔드)로 분리 가능.
 

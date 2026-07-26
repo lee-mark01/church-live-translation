@@ -2,96 +2,120 @@
 
 교회 실시간 설교 번역 자막 시스템.
 
-한국어 설교 음성을 캡처하여 실시간으로 텍스트 변환(STT) 및 번역 후, 방문 외국인 성도에게 자막으로 제공한다.
+한국어 설교 음성을 실시간으로 번역하여 외국인 성도에게 자막으로 제공한다.
 
-## MVP 범위
+## 주요 기능
 
-- 실시간 번역 자막 제공만 포함
-- TTS(음성 합성), speech-to-speech는 현재 범위 밖 (추후 검토)
-
-## 핵심 설계 원칙
-
-실시간 자막 전달 경로와 저장/검토 경로를 분리한다.  
-번역 결과는 성도 화면에 WebSocket으로 즉시 송출하고, PostgreSQL 저장은 비동기로 처리하여 DB 저장 지연이나 실패가 자막 표시를 막지 않도록 한다.
+- **실시간 번역 자막** — 한국어 설교를 영어/중국어 등으로 실시간 스트리밍 번역
+- **관리자 수정** — 잘못 인식된 문장을 관리자가 수정하면 재번역 후 뷰어에 반영
+- **다국어 지원** — 설정 파일 한 줄로 언어 추가 (13개 언어 지원)
+- **세션 로그** — 설교별 원문/번역 기록 자동 저장
+- **뷰어 UX** — 문장 단위 표시, 폰트 크기 조절, 화면 꺼짐 방지, 자동 재연결
 
 ## 지원 언어
 
-| 코드 | 언어 |
-|------|------|
-| en | English |
-| zh-Hans | Simplified Chinese / 简体中文 |
-| zh-Hant | Traditional Chinese / 繁體中文 |
+`src/lib/languages.ts`에서 관리. 주석 해제만으로 추가 가능.
+
+| 코드 | 언어 | 상태 |
+|------|------|------|
+| en | English | 활성 |
+| zh | 中文 | 활성 |
+| ja | 日本語 | 비활성 (주석) |
+| id | Indonesia | 비활성 (주석) |
+
+그 외 사용 가능: es, fr, de, it, pt, ru, ko, hi, vi
 
 ## 기술 스택
 
 | 계층 | 기술 |
 |------|------|
 | Frontend | Next.js (App Router), React, TypeScript, Tailwind CSS |
-| Backend | Next.js API Routes + standalone WebSocket server (`src/server`) |
-| STT | OpenAI Realtime API (GA) — `gpt-4o-transcribe`, transcription session |
-| Translation | OpenAI Responses API — `gpt-4.1-mini`, Structured Outputs |
-| Database | PostgreSQL |
-| Deployment | AWS EC2 |
+| Backend | Standalone WebSocket server (`src/server`) |
+| Translation | OpenAI `gpt-realtime-translate` (실시간 음성→번역) |
+| Correction | OpenAI `gpt-4o-mini` (텍스트 재번역) |
+| Deployment | 교회 PC 로컬 운영 (VPS 전환 가능) |
 
 ## 프로젝트 구조
 
 ```
 src/
-  app/           # Next.js 페이지 및 라우트 (프론트엔드 + API routes)
-    admin/       # 관리자 페이지
-    watch/       # 시청자 자막 페이지 (/watch/[sessionCode])
-  components/    # React 컴포넌트
-    admin/       # 관리자 페이지 컴포넌트
-    viewer/      # 시청자 페이지 컴포넌트
-  lib/           # 프론트/서버 공유 코드
-    audio/       # 오디오 유틸리티
-    time/        # 시간 유틸리티
-    types/       # 공유 타입/인터페이스
-    logger/      # 로깅 유틸리티
-  server/        # 백엔드 전용 코드
-    ws/          # WebSocket 서버
-    openai/      # STT 연동
-    translation/ # 번역 연동
-    session/     # 세션 관리
-    db/          # DB 저장
-docs/            # 아키텍처, 개발 로그, 테스트 계획
-public/          # 정적 파일
+  app/              # Next.js 페이지
+    admin/          # 관리자 콘솔
+    watch/          # 시청자 자막 (/watch/[sessionCode])
+  components/
+    admin/          # 관리자 UI (AudioChunkTest)
+    viewer/         # 시청자 UI (SubtitleViewer)
+  lib/
+    languages.ts    # 언어 설정 (이 파일 하나로 전체 언어 관리)
+    types/          # 공유 타입
+    audio/          # 오디오 유틸리티
+  server/
+    ws/             # WebSocket 서버
+    openai/         # translateClient (실시간), retranslate (수정)
+    session/        # 세션 로거
+docs/               # 아키텍처, 개발 로그
+logs/               # 세션 로그 (gitignore)
 ```
-
-현재는 단일 레포 구조. 추후 필요 시 `apps/web`과 `apps/api`로 분리 가능하도록 설계.
 
 ## 시작하기
 
+### 필수 조건
+
+- Node.js 18+
+- OpenAI API 키
+
+### 설치
+
 ```bash
+git clone https://github.com/lee-mark01/church-live-translation.git
+cd church-live-translation
 npm install
 ```
 
-`.env` 파일을 프로젝트 루트에 생성:
+`.env` 파일 생성:
 
 ```
 OPENAI_API_KEY=sk-...
 ```
 
-서버 실행 (터미널 2개):
+### 실행
 
+**Windows (원클릭):**
+```
+start.bat 더블클릭
+```
+
+**수동 실행 (터미널 2개):**
 ```bash
-npm run dev      # Next.js 프론트엔드 (localhost:3000)
+npm run dev      # Next.js (localhost:3000)
 npm run dev:ws   # WebSocket 서버 (localhost:3001)
 ```
 
-- 관리자 콘솔: http://localhost:3000/admin (QR 코드 + Start/Stop + STT + 번역)
-- 시청자 자막: http://localhost:3000/watch/TEST-001 (또는 admin QR 스캔)
+### 접속
 
-## 오디오 셋업
+- 관리자: http://localhost:3000/admin
+- 시청자: QR 코드 스캔 또는 http://localhost:3000/watch/{세션코드}
 
-Behringer X32 Producer 믹서에서 Behringer UMC202HD USB 오디오 인터페이스를 통해 교회 PC로 입력. OBS와 Chrome이 동시에 같은 입력을 사용 가능.
+## 운영 흐름
+
+1. 관리자가 `/admin`에서 **Start** → 마이크/오디오 입력 캡처 시작
+2. 실시간 번역이 스트리밍으로 진행
+3. 교인이 QR 스캔 → 언어 선택 → 자막 표시
+4. 관리자가 오역 발견 → 문장 클릭 → 수정 → 자동 재번역 → 뷰어 반영
+5. 설교 끝 → **Stop** → 세션 로그 저장 (`logs/{세션코드}.json`)
+
+## 비용
+
+- `gpt-realtime-translate`: $0.034/분/세션
+- 2개 언어 × 1시간 설교 = **~$4/회**
+- 월 4회 예배 기준: **~$16/월**
+- 수정 재번역 (`gpt-4o-mini`): 건당 ~$0.0001 (무시 가능)
 
 ## 문서
 
 - [Architecture](docs/ARCHITECTURE.md) — 시스템 아키텍처
 - [Dev Log](docs/DEV_LOG.md) — 개발 기록
-- [Test Plan](docs/TEST_PLAN.md) — 테스트 계획
 
 ## 보안 정책
 
-이 레포지토리는 public이다. 시크릿, API 키, 인증 정보, 실제 IP 주소, 교회 네트워크 정보, 실제 설교 녹음/녹취록은 저장하지 않는다. 민감한 값은 환경 변수 또는 placeholder를 사용한다.
+이 레포지토리는 public이다. 시크릿, API 키, 인증 정보, 실제 IP 주소, 교회 네트워크 정보, 실제 설교 녹음/녹취록은 저장하지 않는다. 민감한 값은 환경 변수를 사용한다.

@@ -11,11 +11,18 @@ import type {
   TranslateLatency,
   ViewerCountUpdate,
   ServerMessage,
+  OutputLanguage,
 } from '@/lib/types/audio';
+import { LANGUAGES, LANGUAGE_CODES, LANGUAGE_LABELS } from '@/lib/languages';
 
 const OUTPUT_SAMPLE_RATE = 24000;
 const CHUNK_MS = 100;
 const WS_URL = 'ws://localhost:3001';
+
+// Helper to create a Record with all language codes initialized
+function langRecord<T>(init: T): Record<OutputLanguage, T> {
+  return Object.fromEntries(LANGUAGE_CODES.map((c) => [c, init])) as Record<OutputLanguage, T>;
+}
 
 function generateSessionCode(): string {
   const now = new Date();
@@ -48,15 +55,12 @@ export default function AudioChunkTest() {
   const [serverTotalChunks, setServerTotalChunks] = useState(0);
   const [serverDroppedChunks, setServerDroppedChunks] = useState(0);
 
-  // Translation state
-  const [enConnected, setEnConnected] = useState(false);
-  const [zhConnected, setZhConnected] = useState(false);
+  // Translation state (dynamic per language)
+  const [langConnected, setLangConnected] = useState<Record<OutputLanguage, boolean>>(langRecord(false));
   const [viewerCount, setViewerCount] = useState<ViewerCountUpdate | null>(null);
   const [koreanText, setKoreanText] = useState('');
-  const [enText, setEnText] = useState('');
-  const [zhText, setZhText] = useState('');
-  const [enLatency, setEnLatency] = useState<number | null>(null);
-  const [zhLatency, setZhLatency] = useState<number | null>(null);
+  const [langText, setLangText] = useState<Record<OutputLanguage, string>>(langRecord(''));
+  const [langLatency, setLangLatency] = useState<Record<OutputLanguage, number | null>>(langRecord(null));
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -81,8 +85,7 @@ export default function AudioChunkTest() {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       wsRef.current = null;
       setWsConnected(false);
-      setEnConnected(false);
-      setZhConnected(false);
+      setLangConnected(langRecord(false));
       return;
     }
 
@@ -105,8 +108,7 @@ export default function AudioChunkTest() {
       ws!.close();
       wsRef.current = null;
       setWsConnected(false);
-      setEnConnected(false);
-      setZhConnected(false);
+      setLangConnected(langRecord(false));
     }
   }, [stopAudio]);
 
@@ -119,10 +121,8 @@ export default function AudioChunkTest() {
       setServerTotalChunks(0);
       setServerDroppedChunks(0);
       setKoreanText('');
-      setEnText('');
-      setZhText('');
-      setEnLatency(null);
-      setZhLatency(null);
+      setLangText(langRecord(''));
+      setLangLatency(langRecord(null));
       expectedIndexRef.current = 1;
 
       // 1. Connect WebSocket
@@ -150,9 +150,8 @@ export default function AudioChunkTest() {
           }
           case 'translate.connection': {
             const conn = msg as TranslateConnectionStatus;
-            const connected = conn.status === 'connected';
-            if (conn.language === 'en') setEnConnected(connected);
-            if (conn.language === 'zh') setZhConnected(connected);
+            const isConnected = conn.status === 'connected';
+            setLangConnected((prev) => ({ ...prev, [conn.language]: isConnected }));
             if (conn.status === 'error') {
               console.error(`[translate:${conn.language}] error:`, conn.message);
             }
@@ -165,14 +164,12 @@ export default function AudioChunkTest() {
           }
           case 'translation.delta': {
             const delta = msg as TranslationDelta;
-            if (delta.language === 'en') setEnText((prev) => prev + delta.text);
-            if (delta.language === 'zh') setZhText((prev) => prev + delta.text);
+            setLangText((prev) => ({ ...prev, [delta.language]: prev[delta.language] + delta.text }));
             break;
           }
           case 'translate.latency': {
             const lat = msg as TranslateLatency;
-            if (lat.language === 'en') setEnLatency(lat.ms);
-            if (lat.language === 'zh') setZhLatency(lat.ms);
+            setLangLatency((prev) => ({ ...prev, [lat.language]: lat.ms }));
             break;
           }
           case 'viewer.count': {
@@ -184,8 +181,7 @@ export default function AudioChunkTest() {
 
       ws.onclose = () => {
         setWsConnected(false);
-        setEnConnected(false);
-        setZhConnected(false);
+        setLangConnected(langRecord(false));
       };
 
       // 2. Get audio stream
@@ -344,8 +340,9 @@ export default function AudioChunkTest() {
 
           <Badge active={isRunning} label={isRunning ? 'Running' : 'Stopped'} />
           <Badge active={wsConnected} label={wsConnected ? 'WS' : 'WS Off'} />
-          <Badge active={enConnected} label={enConnected ? 'EN' : 'EN Off'} />
-          <Badge active={zhConnected} label={zhConnected ? 'ZH' : 'ZH Off'} />
+          {LANGUAGES.map(({ code }) => (
+            <Badge key={code} active={langConnected[code]} label={langConnected[code] ? code.toUpperCase() : `${code.toUpperCase()} Off`} />
+          ))}
         </div>
 
         {/* RMS level bar */}
@@ -367,16 +364,16 @@ export default function AudioChunkTest() {
         )}
 
         {/* Latency */}
-        {(enLatency !== null || zhLatency !== null) && (
+        {LANGUAGE_CODES.some((c) => langLatency[c] !== null) && (
           <p className="mt-2 text-xs text-zinc-400">
-            Latency: EN {enLatency !== null ? `${enLatency}ms` : '—'} · ZH {zhLatency !== null ? `${zhLatency}ms` : '—'}
+            Latency: {LANGUAGES.map(({ code }) => `${code.toUpperCase()} ${langLatency[code] !== null ? `${langLatency[code]}ms` : '—'}`).join(' · ')}
           </p>
         )}
 
         {/* Viewer count */}
         <p className="mt-2 text-xs text-zinc-400">
           Viewers: {viewerCount
-            ? `${viewerCount.total} (EN ${viewerCount.byLanguage.en} · 中 ${viewerCount.byLanguage.zh})`
+            ? `${viewerCount.total} (${LANGUAGES.map(({ code, label }) => `${label} ${viewerCount.byLanguage[code] ?? 0}`).join(' · ')})`
             : '—'}
         </p>
       </section>
@@ -393,7 +390,7 @@ export default function AudioChunkTest() {
           Live Translation
         </h2>
         <div className="space-y-4 min-h-[120px]">
-          {!enConnected && !zhConnected ? (
+          {!LANGUAGE_CODES.some((c) => langConnected[c]) ? (
             <p className="text-sm text-zinc-400">Translation not connected</p>
           ) : (
             <>
@@ -401,14 +398,12 @@ export default function AudioChunkTest() {
                 <p className="text-xs font-semibold text-zinc-400 mb-1">Korean (source)</p>
                 <p className="text-sm whitespace-pre-wrap">{koreanText || <span className="text-zinc-400 italic">Waiting for speech...</span>}</p>
               </div>
-              <div>
-                <p className="text-xs font-semibold text-zinc-400 mb-1">English</p>
-                <p className="text-sm whitespace-pre-wrap">{enText || <span className="text-zinc-400 italic">—</span>}</p>
-              </div>
-              <div>
-                <p className="text-xs font-semibold text-zinc-400 mb-1">中文</p>
-                <p className="text-sm whitespace-pre-wrap">{zhText || <span className="text-zinc-400 italic">—</span>}</p>
-              </div>
+              {LANGUAGES.map(({ code, label }) => (
+                <div key={code}>
+                  <p className="text-xs font-semibold text-zinc-400 mb-1">{label}</p>
+                  <p className="text-sm whitespace-pre-wrap">{langText[code] || <span className="text-zinc-400 italic">—</span>}</p>
+                </div>
+              ))}
             </>
           )}
         </div>

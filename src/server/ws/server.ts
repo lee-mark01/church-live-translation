@@ -15,7 +15,9 @@ import type {
   ViewerCountUpdate,
   OutputLanguage,
   SubtitleDelta,
+  SubtitleHistory,
 } from '../../lib/types/audio';
+import { LANGUAGE_CODES } from '../../lib/languages';
 
 const PORT = Number(process.env.WS_PORT) || 3001;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -74,12 +76,27 @@ function broadcastToViewers(sessionCode: string, language: ViewerLanguage, text:
   }
 }
 
+// --- Accumulated subtitle text per session per language ---
+const subtitleTexts = new Map<string, Record<ViewerLanguage, string>>();
+
+function appendSubtitleText(sessionCode: string, language: ViewerLanguage, text: string): void {
+  if (!subtitleTexts.has(sessionCode)) {
+    const empty = Object.fromEntries(LANGUAGE_CODES.map((c) => [c, ''])) as Record<ViewerLanguage, string>;
+    subtitleTexts.set(sessionCode, empty);
+  }
+  subtitleTexts.get(sessionCode)![language] += text;
+}
+
+function getSubtitleText(sessionCode: string, language: ViewerLanguage): string {
+  return subtitleTexts.get(sessionCode)?.[language] ?? '';
+}
+
 // --- Admin tracking ---
 const adminClients = new Map<string, WebSocket>();
 
 function getViewerCount(sessionCode: string): { total: number; byLanguage: Record<ViewerLanguage, number> } {
   const clients = viewers.get(sessionCode) ?? [];
-  const byLanguage: Record<ViewerLanguage, number> = { en: 0, zh: 0 };
+  const byLanguage = Object.fromEntries(LANGUAGE_CODES.map((c) => [c, 0])) as Record<ViewerLanguage, number>;
   for (const c of clients) {
     byLanguage[c.language]++;
   }
@@ -129,6 +146,13 @@ wss.on('connection', (ws: WebSocket) => {
       const join = msg as unknown as ViewerJoin;
       role = 'viewer';
       addViewer(join.sessionCode, { ws, language: join.language });
+
+      // Send accumulated subtitle history
+      const history = getSubtitleText(join.sessionCode, join.language);
+      if (history) {
+        const historyMsg: SubtitleHistory = { type: 'subtitle.history', text: history };
+        ws.send(JSON.stringify(historyMsg));
+      }
       return;
     }
 
@@ -141,6 +165,11 @@ wss.on('connection', (ws: WebSocket) => {
           client.language = change.language;
           console.log(`[ws] viewer changed language to ${change.language}`);
           notifyAdminViewerCount(sessionCode);
+
+          // Send accumulated subtitle history for the new language
+          const history = getSubtitleText(sessionCode, change.language);
+          const historyMsg: SubtitleHistory = { type: 'subtitle.history', text: history };
+          ws.send(JSON.stringify(historyMsg));
           break;
         }
       }
@@ -181,10 +210,11 @@ wss.on('connection', (ws: WebSocket) => {
 
       notifyAdminViewerCount(adminSessionCode);
 
-      // Start translation sessions
+      // Start translation sessions for all configured languages
       if (OPENAI_API_KEY) {
-        startTranslateSession('en');
-        startTranslateSession('zh');
+        for (const lang of LANGUAGE_CODES) {
+          startTranslateSession(lang);
+        }
       }
     }
 
@@ -278,8 +308,8 @@ wss.on('connection', (ws: WebSocket) => {
       sendToAdmin<TranslateLatency>({ type: 'translate.latency', language, ms });
     });
 
-    // Korean source transcript (only need from one session, use 'en')
-    if (language === 'en') {
+    // Korean source transcript (only need from one session, use the first language)
+    if (language === LANGUAGE_CODES[0]) {
       client.on('input_delta', (text) => {
         sendToAdmin<TranscriptDelta>({ type: 'transcript.delta', text });
         logger?.appendInput(text);
@@ -295,11 +325,10 @@ wss.on('connection', (ws: WebSocket) => {
         text,
       });
 
-      // Accumulate for session log
+      // Accumulate for session log + subtitle history
       logger?.appendOutput(language, text);
-
-      // Broadcast to viewers of this language
       if (adminSessionCode) {
+        appendSubtitleText(adminSessionCode, language, text);
         broadcastToViewers(adminSessionCode, language, text);
       }
     });

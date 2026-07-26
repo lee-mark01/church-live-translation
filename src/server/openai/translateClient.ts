@@ -4,7 +4,7 @@ import { EventEmitter } from 'events';
 const OPENAI_TRANSLATE_URL =
   'wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
 
-type OutputLanguage = 'en' | 'zh';
+import type { OutputLanguage } from '../../lib/languages';
 
 interface TranslateEvents {
   connected: [];

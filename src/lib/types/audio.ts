@@ -52,6 +52,12 @@ export interface SubtitleDelta {
   text: string;
 }
 
+/** Server → Browser (viewer): full subtitle history on language change */
+export interface SubtitleHistory {
+  type: 'subtitle.history';
+  text: string;
+}
+
 /** Server → Browser: translation session connection status */
 export interface TranslateConnectionStatus {
   type: 'translate.connection';
@@ -67,11 +73,12 @@ export interface TranslateLatency {
   ms: number;
 }
 
-/** Supported output languages for gpt-realtime-translate */
-export type OutputLanguage = 'en' | 'zh';
+// OutputLanguage is defined in and re-exported from '@/lib/languages'
+export type { OutputLanguage } from '../languages';
+import type { OutputLanguage } from '../languages';
 
-/** Supported viewer languages (zh serves both simplified and traditional for now) */
-export type ViewerLanguage = 'en' | 'zh';
+/** Viewer language is the same as output language */
+export type ViewerLanguage = OutputLanguage;
 
 /** Browser → Server: viewer joins a session */
 export interface ViewerJoin {
@@ -105,4 +112,4 @@ export type ServerMessage =
   | ViewerCountUpdate;
 
 /** Union of all server → viewer browser messages */
-export type ViewerMessage = SubtitleDelta;
+export type ViewerMessage = SubtitleDelta | SubtitleHistory;

@@ -66,6 +66,13 @@ export interface ViewerSentence {
   corrected?: boolean;
 }
 
+/** Server → Browser (viewer): a translation sentence was finalized */
+export interface SubtitleSentenceComplete {
+  type: 'subtitle.sentence.complete';
+  sentence: ViewerSentence;
+  streamingText: string; // remaining text not yet in a sentence
+}
+
 /** Server → Browser (viewer): a sentence was corrected — replace it */
 export interface SubtitleCorrection {
   type: 'subtitle.correction';
@@ -157,5 +164,31 @@ export type ServerMessage =
   | SentenceComplete
   | CorrectionResult;
 
+/** Server → Browser (viewer): TTS audio sentence start */
+export interface TtsSentenceStart {
+  type: 'tts.sentence.start';
+  sentenceId: string;
+}
+
+/** Server → Browser (viewer): TTS audio chunk */
+export interface TtsChunk {
+  type: 'tts.chunk';
+  sentenceId: string;
+  audio: string; // base64 PCM16 24kHz mono
+}
+
+/** Server → Browser (viewer): TTS audio sentence end */
+export interface TtsSentenceEnd {
+  type: 'tts.sentence.end';
+  sentenceId: string;
+}
+
 /** Union of all server → viewer browser messages */
-export type ViewerMessage = SubtitleDelta | SubtitleHistory | SubtitleCorrection;
+export type ViewerMessage =
+  | SubtitleDelta
+  | SubtitleHistory
+  | SubtitleSentenceComplete
+  | SubtitleCorrection
+  | TtsSentenceStart
+  | TtsChunk
+  | TtsSentenceEnd;

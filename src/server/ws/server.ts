@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { TranslateClient } from '../openai/translateClient';
 import { retranslateKorean } from '../openai/retranslate';
+import { streamTts } from '../openai/ttsClient';
 import { SessionLogger } from '../session/sessionLogger';
 import type {
   AudioChunkMessage,
@@ -18,11 +19,15 @@ import type {
   SubtitleDelta,
   SubtitleHistory,
   SubtitleCorrection,
+  SubtitleSentenceComplete,
   AdminSentence,
   SentenceComplete,
   CorrectionRequest,
   CorrectionResult,
   ViewerSentence,
+  TtsSentenceStart,
+  TtsChunk,
+  TtsSentenceEnd,
 } from '../../lib/types/audio';
 import { LANGUAGE_CODES } from '../../lib/languages';
 
@@ -164,6 +169,186 @@ function getViewerHistory(sessionCode: string, language: ViewerLanguage): { sent
     : data.translationBuffers[language] || '';
 
   return { sentences, streamingText };
+}
+
+// --- TTS clause-based streaming system ---
+
+// Clause boundary detection for TTS (more aggressive than sentence detection)
+const CLAUSE_BOUNDARY_RE = /[,;:，；：.!?。？！]\s*/;
+const TTS_MIN_CHARS = 10;        // Don't TTS chunks shorter than this
+const TTS_MAX_CHARS = 60;        // Force flush if buffer exceeds this without punctuation
+const TTS_FLUSH_TIMEOUT_MS = 2000; // Force flush after 2s of silence with pending text
+
+interface TtsQueueItem {
+  chunkId: string;
+  text: string;
+}
+
+// Per-language TTS buffer for clause accumulation
+interface TtsBufferState {
+  buffer: string;
+  chunkCounter: number;
+  flushTimer: ReturnType<typeof setTimeout> | null;
+}
+
+// sessionCode → language → queue + processing state
+const ttsQueues = new Map<string, Map<OutputLanguage, { queue: TtsQueueItem[]; processing: boolean }>>();
+const ttsBuffers = new Map<string, Map<OutputLanguage, TtsBufferState>>();
+
+function getTtsQueue(sessionCode: string, language: OutputLanguage) {
+  if (!ttsQueues.has(sessionCode)) {
+    ttsQueues.set(sessionCode, new Map());
+  }
+  const langQueues = ttsQueues.get(sessionCode)!;
+  if (!langQueues.has(language)) {
+    langQueues.set(language, { queue: [], processing: false });
+  }
+  return langQueues.get(language)!;
+}
+
+function getTtsBuffer(sessionCode: string, language: OutputLanguage): TtsBufferState {
+  if (!ttsBuffers.has(sessionCode)) {
+    ttsBuffers.set(sessionCode, new Map());
+  }
+  const langBuffers = ttsBuffers.get(sessionCode)!;
+  if (!langBuffers.has(language)) {
+    langBuffers.set(language, { buffer: '', chunkCounter: 0, flushTimer: null });
+  }
+  return langBuffers.get(language)!;
+}
+
+/**
+ * Feed translation delta text into the TTS buffer.
+ * Splits on clause boundaries and enqueues for TTS when ready.
+ */
+function feedTtsBuffer(sessionCode: string, language: OutputLanguage, text: string): void {
+  if (!OPENAI_API_KEY) return;
+
+  const buf = getTtsBuffer(sessionCode, language);
+  buf.buffer += text;
+
+  // Clear existing flush timer — we just got new text
+  if (buf.flushTimer) {
+    clearTimeout(buf.flushTimer);
+    buf.flushTimer = null;
+  }
+
+  // Try to extract clause chunks
+  extractAndEnqueueClauses(sessionCode, language);
+
+  // Set a timeout to flush remaining buffer if no more text arrives
+  if (buf.buffer.trim().length > 0) {
+    buf.flushTimer = setTimeout(() => {
+      flushTtsBuffer(sessionCode, language);
+    }, TTS_FLUSH_TIMEOUT_MS);
+  }
+}
+
+function extractAndEnqueueClauses(sessionCode: string, language: OutputLanguage): void {
+  const buf = getTtsBuffer(sessionCode, language);
+
+  while (true) {
+    const match = buf.buffer.match(CLAUSE_BOUNDARY_RE);
+    if (!match || match.index === undefined) {
+      // No clause boundary found — check if buffer is too long
+      if (buf.buffer.length >= TTS_MAX_CHARS) {
+        // Force split at last space
+        const lastSpace = buf.buffer.lastIndexOf(' ', TTS_MAX_CHARS);
+        const splitAt = lastSpace > TTS_MIN_CHARS ? lastSpace : TTS_MAX_CHARS;
+        const chunk = buf.buffer.slice(0, splitAt).trim();
+        buf.buffer = buf.buffer.slice(splitAt).trimStart();
+        if (chunk.length >= TTS_MIN_CHARS) {
+          // Add comma hint for continuation prosody
+          enqueueTtsChunk(sessionCode, language, chunk + ',');
+        }
+      }
+      break;
+    }
+
+    const endIdx = match.index + match[0].length;
+    const chunk = buf.buffer.slice(0, endIdx).trim();
+    buf.buffer = buf.buffer.slice(endIdx);
+
+    if (chunk.length >= TTS_MIN_CHARS) {
+      enqueueTtsChunk(sessionCode, language, chunk);
+    } else if (chunk.length > 0) {
+      // Too short — prepend back to buffer for next clause
+      buf.buffer = chunk + ' ' + buf.buffer;
+      break; // Wait for more text
+    }
+  }
+}
+
+function flushTtsBuffer(sessionCode: string, language: OutputLanguage): void {
+  const buf = getTtsBuffer(sessionCode, language);
+  const text = buf.buffer.trim();
+  buf.flushTimer = null;
+
+  if (text.length > 0) {
+    // Add comma for continuation prosody if no sentence-ending punctuation
+    const endsWithSentence = /[.!?。？！]$/.test(text);
+    enqueueTtsChunk(sessionCode, language, endsWithSentence ? text : text + ',');
+    buf.buffer = '';
+  }
+}
+
+function enqueueTtsChunk(sessionCode: string, language: OutputLanguage, text: string): void {
+  const buf = getTtsBuffer(sessionCode, language);
+  const chunkId = `tts-${language}-${++buf.chunkCounter}`;
+  const q = getTtsQueue(sessionCode, language);
+  q.queue.push({ chunkId, text });
+  console.log(`[tts:${language}] enqueued ${chunkId}: "${text.slice(0, 50)}${text.length > 50 ? '...' : ''}"`);
+  if (!q.processing) {
+    processTtsQueue(sessionCode, language);
+  }
+}
+
+async function processTtsQueue(sessionCode: string, language: OutputLanguage): Promise<void> {
+  const q = getTtsQueue(sessionCode, language);
+  if (q.processing || q.queue.length === 0) return;
+  q.processing = true;
+
+  while (q.queue.length > 0) {
+    const item = q.queue.shift()!;
+    try {
+      broadcastToViewers(sessionCode, language, {
+        type: 'tts.sentence.start',
+        sentenceId: item.chunkId,
+      } satisfies TtsSentenceStart);
+
+      await streamTts(OPENAI_API_KEY!, item.text, language, (pcm16Buffer) => {
+        broadcastToViewers(sessionCode, language, {
+          type: 'tts.chunk',
+          sentenceId: item.chunkId,
+          audio: pcm16Buffer.toString('base64'),
+        } satisfies TtsChunk);
+      });
+
+      broadcastToViewers(sessionCode, language, {
+        type: 'tts.sentence.end',
+        sentenceId: item.chunkId,
+      } satisfies TtsSentenceEnd);
+
+      console.log(`[tts:${language}] streamed ${item.chunkId}`);
+    } catch (err) {
+      console.error(`[tts:${language}] failed ${item.chunkId}:`, err);
+    }
+  }
+
+  q.processing = false;
+}
+
+function clearTtsState(sessionCode: string): void {
+  // Clear queues
+  ttsQueues.delete(sessionCode);
+  // Clear buffers and timers
+  const langBuffers = ttsBuffers.get(sessionCode);
+  if (langBuffers) {
+    for (const buf of langBuffers.values()) {
+      if (buf.flushTimer) clearTimeout(buf.flushTimer);
+    }
+    ttsBuffers.delete(sessionCode);
+  }
 }
 
 // --- Admin tracking ---
@@ -311,6 +496,9 @@ wss.on('connection', (ws: WebSocket) => {
       }
       translateSessions.clear();
 
+      // Clear TTS state
+      if (adminSessionCode) clearTtsState(adminSessionCode);
+
       // Save session log
       logger?.save();
 
@@ -391,6 +579,7 @@ wss.on('connection', (ws: WebSocket) => {
         client.disconnect();
       }
       translateSessions.clear();
+      if (adminSessionCode) clearTtsState(adminSessionCode);
       logger?.save();
     } else if (role === 'viewer') {
       removeViewer(ws);
@@ -524,6 +713,9 @@ wss.on('connection', (ws: WebSocket) => {
           text,
         } satisfies SubtitleDelta);
 
+        // Feed translation text into TTS clause buffer
+        feedTtsBuffer(adminSessionCode, language, text);
+
         // Sentence segmentation for translations
         data.translationBuffers[language] += text;
 
@@ -546,6 +738,20 @@ wss.on('connection', (ws: WebSocket) => {
               console.log(`[ws] translation [${language}] filled for ${data.sentences[idx].id}: "${trimmed}"`);
               // Notify admin of updated sentence
               sendToAdmin<SentenceComplete>({ type: 'sentence.complete', sentence: data.sentences[idx] });
+              // Notify viewers: sentence finalized (moves streamingText → sentences)
+              // Calculate remaining streaming text for this language
+              const sentenceTexts = data.sentences
+                .filter((s) => s.translations[language])
+                .map((s) => s.translations[language]!).join('');
+              const remainingStream = data.fullTexts[language].startsWith(sentenceTexts)
+                ? data.fullTexts[language].slice(sentenceTexts.length)
+                : data.translationBuffers[language] || '';
+              broadcastToViewers(adminSessionCode, language, {
+                type: 'subtitle.sentence.complete',
+                sentence: { id: data.sentences[idx].id, text: trimmed },
+                streamingText: remainingStream,
+              } satisfies SubtitleSentenceComplete);
+              // TTS is now handled by clause-level feedTtsBuffer, not here
             }
             data.translationSentenceIdx[language]++;
           }

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ViewerLanguage, ViewerMessage, ViewerSentence } from '@/lib/types/audio';
 import { LANGUAGES, LANGUAGE_LABELS } from '@/lib/languages';
+import { TtsPlayer } from '@/lib/audio/ttsPlayer';
 
 const WS_URL = 'ws://localhost:3001';
 
@@ -51,7 +52,10 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
   const [isAutoScroll, setIsAutoScroll] = useState(true);
   const [correctedIds, setCorrectedIds] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<{ sentenceId: string; text: string } | null>(null);
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [playingSentenceId, setPlayingSentenceId] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const ttsRef = useRef<TtsPlayer | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentenceRefs = useRef<Map<string, HTMLParagraphElement>>(new Map());
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -138,6 +142,16 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
           setSentences(msg.sentences);
           setStreamingText(msg.streamingText || '');
           break;
+        case 'subtitle.sentence.complete': {
+          const { sentence } = msg;
+          setSentences((prev) => {
+            if (prev.some((s) => s.id === sentence.id)) return prev;
+            return [...prev, sentence];
+          });
+          // Server sends authoritative remaining streamingText
+          setStreamingText(msg.streamingText);
+          break;
+        }
         case 'subtitle.correction': {
           setSentences((prev) =>
             prev.map((s) =>
@@ -161,6 +175,16 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
           toastTimerRef.current = setTimeout(() => setToast(null), 5000);
           break;
         }
+        // TTS audio messages
+        case 'tts.sentence.start':
+          ttsRef.current?.enqueueSentence(msg.sentenceId);
+          break;
+        case 'tts.chunk':
+          ttsRef.current?.feedChunk(msg.sentenceId, msg.audio);
+          break;
+        case 'tts.sentence.end':
+          ttsRef.current?.endSentence(msg.sentenceId);
+          break;
       }
     };
 
@@ -181,6 +205,8 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
     return () => {
       wsRef.current?.close();
       wsRef.current = null;
+      ttsRef.current?.destroy();
+      ttsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -215,6 +241,27 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
     scheduleHideControls();
   };
 
+  const toggleAudio = async () => {
+    if (!audioEnabled) {
+      // Initialize TTS player on first tap (user gesture required)
+      if (!ttsRef.current) {
+        const player = new TtsPlayer();
+        player.onSentenceStart = (id) => setPlayingSentenceId(id);
+        player.onSentenceEnd = () => setPlayingSentenceId(null);
+        ttsRef.current = player;
+      }
+      await ttsRef.current.init();
+      ttsRef.current.setVolume(1);
+      setAudioEnabled(true);
+    } else {
+      ttsRef.current?.setVolume(0);
+      ttsRef.current?.stop();
+      setAudioEnabled(false);
+      setPlayingSentenceId(null);
+    }
+    scheduleHideControls();
+  };
+
   const hasContent = sentences.length > 0 || streamingText;
 
   return (
@@ -239,6 +286,19 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
 
           {/* Right: controls */}
           <div className="flex items-center gap-2">
+            {/* Audio toggle */}
+            <button
+              onClick={(e) => { e.stopPropagation(); toggleAudio(); }}
+              className={`rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                audioEnabled
+                  ? 'bg-emerald-900/50 text-emerald-400'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+              aria-label={audioEnabled ? 'Disable audio' : 'Enable audio'}
+            >
+              {audioEnabled ? '🔊' : '🔇'}
+            </button>
+
             {/* Font size toggle */}
             <button
               onClick={(e) => { e.stopPropagation(); cycleFontSize(); }}
@@ -286,9 +346,11 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
                 className={`${FONT_SIZE_CLASSES[fontSize]} font-medium transition-all duration-500 ${
                   correctedIds.has(sentence.id)
                     ? 'text-amber-300'
-                    : sentence.corrected
-                      ? 'text-amber-200/70'
-                      : 'text-[#F5F0E8] opacity-50'
+                    : playingSentenceId === sentence.id
+                      ? 'text-[#F5F0E8] opacity-90'
+                      : sentence.corrected
+                        ? 'text-amber-200/70'
+                        : 'text-[#F5F0E8] opacity-50'
                 }`}
               >
                 {sentence.text}

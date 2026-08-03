@@ -6,7 +6,10 @@
     "dev": "next dev",
     "dev:ws": "node --env-file=.env --import tsx src/server/ws/server.ts",
     "build": "next build",
+    "build:server": "esbuild src/server/combined.ts --bundle --platform=node --format=cjs --outfile=dist-server/combined.cjs --packages=external --tsconfig=tsconfig.json",
+    "build:all": "npm run build && npm run build:server",
     "start": "next start",
+    "start:prod": "node dist-server/combined.cjs",
     "lint": "eslint"
   },
   "dependencies": {

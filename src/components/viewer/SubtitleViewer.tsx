@@ -4,8 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ViewerLanguage, ViewerMessage, ViewerSentence } from '@/lib/types/audio';
 import { LANGUAGES, LANGUAGE_LABELS } from '@/lib/languages';
 import { TtsPlayer } from '@/lib/audio/ttsPlayer';
-
-const WS_URL = 'ws://localhost:3001';
+import { getWsUrl } from '@/lib/wsUrl';
 
 type FontSize = 'sm' | 'md' | 'lg';
 const FONT_SIZE_CLASSES: Record<FontSize, string> = {
@@ -120,7 +119,7 @@ export default function SubtitleViewer({ sessionCode }: { sessionCode: string })
       wsRef.current = null;
     }
 
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(getWsUrl());
     wsRef.current = ws;
 
     ws.onopen = () => {

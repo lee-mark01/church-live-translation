@@ -17,10 +17,10 @@ import type {
   CorrectionResult,
 } from '@/lib/types/audio';
 import { LANGUAGES, LANGUAGE_CODES, LANGUAGE_LABELS } from '@/lib/languages';
+import { getWsUrl } from '@/lib/wsUrl';
 
 const OUTPUT_SAMPLE_RATE = 24000;
 const CHUNK_MS = 100;
-const WS_URL = 'ws://localhost:3001';
 
 // Helper to create a Record with all language codes initialized
 function langRecord<T>(init: T): Record<OutputLanguage, T> {
@@ -136,7 +136,7 @@ export default function AudioChunkTest() {
       expectedIndexRef.current = 1;
 
       // 1. Connect WebSocket
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(getWsUrl());
       wsRef.current = ws;
 
       await new Promise<void>((resolve, reject) => {

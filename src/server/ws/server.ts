@@ -31,11 +31,7 @@ import type {
 } from '../../lib/types/audio';
 import { LANGUAGE_CODES } from '../../lib/languages';
 
-const PORT = Number(process.env.WS_PORT) || 3001;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-const wss = new WebSocketServer({ port: PORT });
-console.log(`[ws] WebSocket server listening on ws://localhost:${PORT}`);
 
 if (!OPENAI_API_KEY) {
   console.warn('[ws] OPENAI_API_KEY not set — translation will be disabled');
@@ -376,8 +372,28 @@ function notifyAdminViewerCount(sessionCode: string): void {
   adminWs.send(JSON.stringify(msg));
 }
 
-// --- Connection handling ---
-wss.on('connection', (ws: WebSocket) => {
+// --- Exported factory: attach handlers to any WebSocketServer ---
+export function attachWsHandlers(wss: WebSocketServer): void {
+  _setupConnectionHandler(wss);
+}
+
+/** Create a standalone WS server on a given port (used by dev:ws script). */
+export function startStandaloneWsServer(port: number): WebSocketServer {
+  const wss = new WebSocketServer({ port });
+  console.log(`[ws] WebSocket server listening on ws://localhost:${port}`);
+  attachWsHandlers(wss);
+  return wss;
+}
+
+/** Create a noServer WS server (used by combined prod server). */
+export function createNoServerWss(): WebSocketServer {
+  const wss = new WebSocketServer({ noServer: true });
+  attachWsHandlers(wss);
+  return wss;
+}
+
+function _setupConnectionHandler(wss: WebSocketServer): void {
+  wss.on('connection', (ws: WebSocket) => {
   console.log('[ws] client connected');
 
   let role: 'unknown' | 'admin' | 'viewer' = 'unknown';
@@ -770,4 +786,17 @@ wss.on('connection', (ws: WebSocket) => {
       ws.send(JSON.stringify(msg));
     }
   }
-});
+  });
+}
+
+// --- Standalone entry point (dev:ws script) ---
+// Only start when this file is run directly (not imported)
+const isDirectRun = process.argv[1] && (
+  process.argv[1].endsWith('server.ts') ||
+  process.argv[1].endsWith('server.js')
+);
+
+if (isDirectRun) {
+  const PORT = Number(process.env.WS_PORT) || 3001;
+  startStandaloneWsServer(PORT);
+}

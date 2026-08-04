@@ -554,6 +554,35 @@ export default function AudioChunkTest() {
         </section>
       )}
 
+      {/* Downloads — visible after session stops with content */}
+      {!isRunning && sentences.length > 0 && (
+        <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">Downloads</h2>
+          <p className="mb-3 text-xs text-zinc-400">
+            세션 종료 후 번역 텍스트와 TTS 음성을 다운로드할 수 있습니다.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <a
+              href={`/api/sessions/${sessionCode}/transcript`}
+              download
+              className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
+            >
+              번역 텍스트 (JSON)
+            </a>
+            {LANGUAGES.map(({ code, label }) => (
+              <a
+                key={code}
+                href={`/api/sessions/${sessionCode}/audio/${code}`}
+                download
+                className="rounded-md bg-zinc-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-600"
+              >
+                {label} 음성 (WAV)
+              </a>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Developer Diagnostics (collapsible) */}
       <section className="rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
         <button

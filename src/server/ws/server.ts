@@ -1,8 +1,11 @@
 import { WebSocketServer, WebSocket } from 'ws';
+import { writeFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import { TranslateClient } from '../openai/translateClient';
 import { retranslateKorean } from '../openai/retranslate';
 import { streamTts } from '../openai/ttsClient';
 import { SessionLogger } from '../session/sessionLogger';
+import { createWavBuffer } from '../audio/wav';
 import type {
   AudioChunkMessage,
   AudioChunkAck,
@@ -191,6 +194,20 @@ interface TtsBufferState {
 const ttsQueues = new Map<string, Map<OutputLanguage, { queue: TtsQueueItem[]; processing: boolean }>>();
 const ttsBuffers = new Map<string, Map<OutputLanguage, TtsBufferState>>();
 
+// Accumulate TTS PCM16 chunks for WAV export
+const ttsAudioAccum = new Map<string, Map<OutputLanguage, Buffer[]>>();
+
+function getTtsAudioAccum(sessionCode: string, language: OutputLanguage): Buffer[] {
+  if (!ttsAudioAccum.has(sessionCode)) {
+    ttsAudioAccum.set(sessionCode, new Map());
+  }
+  const langAccum = ttsAudioAccum.get(sessionCode)!;
+  if (!langAccum.has(language)) {
+    langAccum.set(language, []);
+  }
+  return langAccum.get(language)!;
+}
+
 function getTtsQueue(sessionCode: string, language: OutputLanguage) {
   if (!ttsQueues.has(sessionCode)) {
     ttsQueues.set(sessionCode, new Map());
@@ -312,7 +329,10 @@ async function processTtsQueue(sessionCode: string, language: OutputLanguage): P
         sentenceId: item.chunkId,
       } satisfies TtsSentenceStart);
 
+      const audioAccum = getTtsAudioAccum(sessionCode, language);
       await streamTts(OPENAI_API_KEY!, item.text, language, (pcm16Buffer) => {
+        // Save for WAV export
+        audioAccum.push(Buffer.from(pcm16Buffer));
         broadcastToViewers(sessionCode, language, {
           type: 'tts.chunk',
           sentenceId: item.chunkId,
@@ -334,7 +354,30 @@ async function processTtsQueue(sessionCode: string, language: OutputLanguage): P
   q.processing = false;
 }
 
+function saveTtsAudio(sessionCode: string): void {
+  const langAccum = ttsAudioAccum.get(sessionCode);
+  if (!langAccum) return;
+
+  const logsDir = join(process.cwd(), 'logs');
+  mkdirSync(logsDir, { recursive: true });
+
+  for (const [language, chunks] of langAccum) {
+    if (chunks.length === 0) continue;
+    const wav = createWavBuffer(chunks, 24000);
+    const filePath = join(logsDir, `${sessionCode}-${language}.wav`);
+    try {
+      writeFileSync(filePath, wav);
+      console.log(`[tts] saved audio: ${filePath} (${(wav.length / 1024 / 1024).toFixed(1)}MB)`);
+    } catch (err) {
+      console.error(`[tts] save failed:`, err);
+    }
+  }
+}
+
 function clearTtsState(sessionCode: string): void {
+  // Save accumulated audio before clearing
+  saveTtsAudio(sessionCode);
+  ttsAudioAccum.delete(sessionCode);
   // Clear queues
   ttsQueues.delete(sessionCode);
   // Clear buffers and timers
